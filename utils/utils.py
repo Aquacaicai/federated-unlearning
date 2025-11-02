@@ -11,7 +11,7 @@ class Utils():
             model1_flattened = nn.utils.parameters_to_vector(model1.parameters())
             model2_flattened = nn.utils.parameters_to_vector(model2.parameters())
             distance = torch.square(torch.norm(model1_flattened - model2_flattened))
-        return distance
+        return distance.item()
 
     @staticmethod
     def get_distances_from_current_model(current_model, party_models):
@@ -23,15 +23,20 @@ class Utils():
 
     def evaluate(testloader, model):
         model.eval()
+        device = next(model.parameters()).device
         correct = 0
         total = 0
         with torch.no_grad():
             for data in testloader:
                 images, labels = data
+                images = images.to(device)
+                labels = labels.to(device)
                 outputs = model(images)
                 _, predicted = torch.max(outputs.data, 1)
                 total += labels.size(0)
                 correct += (predicted == labels).sum().item()
 
         return 100 * correct / total
+
+
 
