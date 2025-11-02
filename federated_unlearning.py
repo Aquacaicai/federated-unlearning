@@ -20,6 +20,8 @@ from utils.fusion import Fusion, FusionAvg, FusionRetrain
 torch.manual_seed(0)
 np.random.seed(0)
 
+device = torch.device('cuda')
+
 def FL_round_fusion_selection(num_parties, fusion_key='FedAvg'):
 
     fusion_class_dict = {
@@ -156,7 +158,7 @@ for fusion_key in fusion_types:
 
 party_models_dict = {}
 
-initial_model = FLNet()
+initial_model = FLNet().to(device)
 model_dict = {}
 for fusion_key in fusion_types:
     model_dict[fusion_key] = copy.deepcopy(initial_model.state_dict())
@@ -177,7 +179,7 @@ for round_num in range(num_fl_rounds):
         for party_id in range(num_parties):
 
             if fusion_key == 'Retrain' and party_id == party_to_be_erased:
-                party_models.append(FLNet())
+                party_models.append(FLNet().to(device))
             else:
                 model = copy.deepcopy(current_model)
                 model_update, party_loss = local_training.train(model=model, 
@@ -195,7 +197,7 @@ for round_num in range(num_fl_rounds):
         model_dict[fusion_key] = copy.deepcopy(current_model_state_dict)
         party_models_dict[fusion_key] = party_models  
 
-        eval_model = FLNet()
+        eval_model = FLNet().to(device)
         eval_model.load_state_dict(current_model_state_dict)
         clean_acc = Utils.evaluate(testloader, eval_model)
         clean_accuracy[fusion_key][round_num] = clean_acc
@@ -220,7 +222,7 @@ distance_threshold = 2.2
 clip_grad = 5
 
 
-initial_model = FLNet()
+initial_model = FLNet().to(device)
 unlearned_model_dict = {}
 for fusion_key in fusion_types_unlearn:
     if fusion_key == 'Retrain':
@@ -236,7 +238,7 @@ for fusion_key in fusion_types:
     if fusion_key == 'Retrain':
         continue
 
-    initial_model = FLNet()
+    initial_model = FLNet().to(device)
     fedavg_model_state_dict = copy.deepcopy(model_dict[fusion_key])
     fedavg_model = copy.deepcopy(initial_model)
     fedavg_model.load_state_dict(fedavg_model_state_dict)
@@ -261,7 +263,7 @@ for fusion_key in fusion_types:
 
     dist_ref_random_lst = []
     for _ in range(10):
-        dist_ref_random_lst.append(Utils.get_distance(model_ref, FLNet()))    
+        dist_ref_random_lst.append(Utils.get_distance(model_ref, FLNet().to(device)))    
 
     print(f'Mean distance of Reference Model to random: {np.mean(dist_ref_random_lst)}')
     threshold = np.mean(dist_ref_random_lst) / 3
@@ -286,6 +288,8 @@ for fusion_key in fusion_types:
             break
         for batch_id, (x_batch, y_batch) in enumerate(trainloader_lst[party_to_be_erased]):
 
+            x_batch = x_batch.to(device)
+            y_batch = y_batch.to(device)
             opt.zero_grad()
 
             outputs = model(x_batch)
@@ -320,7 +324,7 @@ for fusion_key in fusion_types:
     unlearned_model = copy.deepcopy(model)
     unlearned_model_dict[fusion_types_unlearn[1]] = unlearned_model.state_dict() 
 
-    eval_model = FLNet()
+    eval_model = FLNet().to(device)
     eval_model.load_state_dict(unlearned_model_dict[fusion_types_unlearn[1]])
     unlearn_clean_acc = Utils.evaluate(testloader, eval_model)
     print(f'Clean Accuracy for UN-Local Model = {unlearn_clean_acc}')
@@ -351,7 +355,7 @@ for round_num in range(num_fl_after_unlearn_rounds):
         fusion = FL_round_fusion_selection(num_parties=num_parties - 1, fusion_key=fusion_key)
 
         current_model_state_dict = copy.deepcopy(unlearned_model_dict[fusion_key])    
-        current_model = FLNet()
+        current_model = FLNet().to(device)
         current_model.load_state_dict(current_model_state_dict)
 
         ##################### Local Training Round #############################
@@ -373,7 +377,7 @@ for round_num in range(num_fl_after_unlearn_rounds):
         unlearned_model_dict[fusion_key] = copy.deepcopy(current_model_state_dict)
         party_models_dict[fusion_key] = party_models  
 
-        eval_model = FLNet()
+        eval_model = FLNet().to(device)
         eval_model.load_state_dict(current_model_state_dict)
         unlearn_clean_acc = Utils.evaluate(testloader, eval_model)
         print(f'Global Clean Accuracy {fusion_key}, round {round_num} = {unlearn_clean_acc}')
