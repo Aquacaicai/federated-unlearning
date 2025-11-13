@@ -47,6 +47,10 @@ ASYNC_SNAPSHOT_KEEP = 20
 ASYNC_EVAL_INTERVAL = 5
 ASYNC_MAX_VERSION = 50
 ASYNC_UNLEARN_TRIGGER = 25
+BASE_CLIENT_LR = 1e-2
+POST_UNLEARN_LR = 5e-4
+POST_UNLEARN_MAX_UPDATES = 20
+ASYNC_STOP_AFTER_UNLEARN_ROUNDS = 15
 
 
 def clone_state_dict(state_dict):
@@ -251,18 +255,21 @@ class AsyncServer:
 
 class ClientSimulator:
     def __init__(self, client_id, trainloader, server, num_local_epochs=1,
-                 num_updates_in_epoch=None, compute_speed=(0.0, 0.2)):
+                 num_updates_in_epoch=None, compute_speed=(0.0, 0.2),
+                 base_lr=BASE_CLIENT_LR):
         self.client_id = client_id
         self.trainloader = trainloader
         self.server = server
-        self.local_training = LocalTraining(num_updates_in_epoch=num_updates_in_epoch,
-                                            num_local_epochs=num_local_epochs)
         self.compute_speed = compute_speed
         self.local_version = 0
         self.active_event = threading.Event()
         self.active_event.set()
         self.stop_event = threading.Event()
         self.thread = None
+        self.config_lock = threading.Lock()
+        self.current_lr = base_lr
+        self.set_local_training_config(num_local_epochs=num_local_epochs,
+                                       num_updates_in_epoch=num_updates_in_epoch)
 
     def start(self):
         if self.thread is not None:
@@ -282,6 +289,18 @@ class ClientSimulator:
     def resume(self):
         self.active_event.set()
 
+    def set_lr(self, new_lr):
+        with self.config_lock:
+            self.current_lr = new_lr
+        logging.info(f"[CLIENT {self.client_id}] learning_rate set to {new_lr}")
+
+    def set_local_training_config(self, num_local_epochs=1, num_updates_in_epoch=None):
+        with self.config_lock:
+            self.local_training = LocalTraining(num_updates_in_epoch=num_updates_in_epoch,
+                                                num_local_epochs=num_local_epochs)
+        logging.info(f"[CLIENT {self.client_id}] local training config updated: epochs={num_local_epochs}, "
+                     f"max_updates={num_updates_in_epoch}")
+
     def _run(self):
         while not self.stop_event.is_set():
             if not self.active_event.is_set():
@@ -294,9 +313,14 @@ class ClientSimulator:
             self.local_version = global_version
 
             initial_state = copy.deepcopy(model.state_dict())
-            model_update, loss = self.local_training.train(model=model,
-                                                           trainloader=self.trainloader,
-                                                           criterion=None, opt=None)
+            with self.config_lock:
+                training_runner = self.local_training
+                lr = self.current_lr
+
+            model_update, loss = training_runner.train(model=model,
+                                                        trainloader=self.trainloader,
+                                                        criterion=None, opt=None,
+                                                        lr=lr)
             updated_state = copy.deepcopy(model_update.state_dict())
             delta_state = subtract_state_dict(updated_state, initial_state)
 
@@ -791,7 +815,8 @@ else:
                                  server=server,
                                  num_local_epochs=1,
                                  num_updates_in_epoch=None,
-                                 compute_speed=(min_delay, max_delay))
+                                 compute_speed=(min_delay, max_delay),
+                                 base_lr=BASE_CLIENT_LR)
         clients.append(client)
         client.start()
         logging.info(f"[CLIENT {client_id}] compute_speed=({min_delay:.2f}, {max_delay:.2f})")
@@ -815,6 +840,8 @@ else:
     unlearn_triggered = False
     reference_version = None
     erased_client_removed = False
+    post_unlearn_stop_version = None
+    post_unlearn_adjustment_done = False
 
     try:
         while server.global_version < ASYNC_MAX_VERSION:
@@ -844,6 +871,19 @@ else:
                 worker.join()
                 server.wait_for_unlearn_completion()
 
+                snapshot_state, snapshot_version = server.get_snapshot()
+                eval_model = FLNet().to(device)
+                eval_model.load_state_dict(snapshot_state)
+                post_clean = Utils.evaluate(testloader, eval_model)
+                post_pois = Utils.evaluate(testloader_poison, eval_model)
+                logging.info(f"[POST-UNLEARN-EVAL] version={snapshot_version} | Clean={post_clean} | Backdoor={post_pois}")
+                eval_versions.append(snapshot_version)
+                clean_history.append(post_clean)
+                poison_history.append(post_pois)
+                recorded_versions.add(snapshot_version)
+                post_unlearn_stop_version = snapshot_version + ASYNC_STOP_AFTER_UNLEARN_ROUNDS
+                logging.info(f"[SERVER] Post-unlearn evaluations logged; async stop target version set to {post_unlearn_stop_version}")
+
                 if not erased_client_removed:
                     erased_index = None
                     for idx, client in enumerate(clients):
@@ -863,6 +903,14 @@ else:
                     for client in clients:
                         client.resume()
 
+                if not post_unlearn_adjustment_done:
+                    for client in clients:
+                        client.set_lr(POST_UNLEARN_LR)
+                        client.set_local_training_config(num_local_epochs=1,
+                                                         num_updates_in_epoch=POST_UNLEARN_MAX_UPDATES)
+                    post_unlearn_adjustment_done = True
+                    logging.info(f"[SERVER] Clients switched to post-unlearn LR={POST_UNLEARN_LR} and max_updates={POST_UNLEARN_MAX_UPDATES}")
+
                 logging.info("[SERVER] Resumed async updates")
                 unlearn_triggered = True
 
@@ -877,6 +925,11 @@ else:
                 clean_history.append(clean_acc)
                 poison_history.append(pois_acc)
                 recorded_versions.add(snapshot_version)
+
+            if (unlearn_triggered and post_unlearn_stop_version is not None and
+                    current_version >= post_unlearn_stop_version):
+                logging.info(f"[SERVER] Reached post-unlearn stop version {post_unlearn_stop_version}; terminating training loop")
+                break
 
     finally:
         for client in clients:
