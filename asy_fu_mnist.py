@@ -48,9 +48,9 @@ ASYNC_EVAL_INTERVAL = 5
 ASYNC_MAX_VERSION = 50
 ASYNC_UNLEARN_TRIGGER = 25
 BASE_CLIENT_LR = 1e-2
-POST_UNLEARN_LR = 5e-4
-POST_UNLEARN_MAX_UPDATES = 20
-ASYNC_STOP_AFTER_UNLEARN_ROUNDS = 15
+POST_UNLEARN_LR = 1e-2
+POST_UNLEARN_MAX_UPDATES = None
+ASYNC_STOP_AFTER_UNLEARN_ROUNDS = 40
 
 
 def clone_state_dict(state_dict):
@@ -340,8 +340,8 @@ class ClientSimulator:
 
 
 class UnlearnWorker(threading.Thread):
-    def __init__(self, server, target_client_id, trainloader, num_local_epochs=5,
-                 lr=0.01, clip_grad=5, mode='replace', reference_version=None,
+    def __init__(self, server, target_client_id, trainloader, num_local_epochs=2,
+                 lr=0.001, clip_grad=5, mode='replace', reference_version=None,
                  testloader=None, testloader_poison=None):
         super().__init__(daemon=True)
         self.server = server
@@ -375,10 +375,11 @@ class UnlearnWorker(threading.Thread):
         dist_ref_random_lst = []
         for _ in range(10):
             dist_ref_random_lst.append(Utils.get_distance(model_ref, FLNet().to(device)))
-        threshold = np.mean(dist_ref_random_lst) / 3
+        threshold = np.mean(dist_ref_random_lst) / 9
+        radius = math.sqrt(threshold)
         dist_ref_party = Utils.get_distance(model_ref, erased_model)
         logging.info(f'Mean distance of Reference Model to random: {np.mean(dist_ref_random_lst)}')
-        logging.info(f'Radius for model_ref: {threshold}')
+        logging.info(f'Radius for model_ref (squared distance): {threshold} | sqrt={radius}')
         logging.info(f'Distance of Reference Model to party0_model: {dist_ref_party}')
 
         model = copy.deepcopy(model_ref)
@@ -406,12 +407,13 @@ class UnlearnWorker(threading.Thread):
                     distance = Utils.get_distance(model, model_ref)
                     if distance > threshold:
                         dist_vec = nn.utils.parameters_to_vector(model.parameters()) - nn.utils.parameters_to_vector(model_ref.parameters())
-                        dist_vec = dist_vec/torch.norm(dist_vec)*np.sqrt(threshold)
+                        dist_vec = dist_vec/torch.norm(dist_vec)*radius
                         proj_vec = nn.utils.parameters_to_vector(model_ref.parameters()) + dist_vec
                         nn.utils.vector_to_parameters(proj_vec, model.parameters())
 
                 distance_ref_party_0 = Utils.get_distance(model, erased_model)
-                logging.info(f'Distance from the unlearned model to party 0: {distance_ref_party_0}')
+                if batch_id % 20 == 0:
+                    logging.info(f'Distance from unlearned model to party 0: {distance_ref_party_0}; to ref={distance}')
 
         unlearned_model_state = copy.deepcopy(model.state_dict())
         self.server.enqueue_unlearn_result({
@@ -860,8 +862,8 @@ else:
                 worker = UnlearnWorker(server=server,
                                        target_client_id=party_to_be_erased,
                                        trainloader=trainloader_lst[party_to_be_erased],
-                                       num_local_epochs=5,
-                                       lr=0.01,
+                                       num_local_epochs=2,
+                                       lr=0.001,
                                        clip_grad=5,
                                        mode='replace',
                                        reference_version=reference_version,
