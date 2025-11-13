@@ -40,8 +40,7 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 # -----------------------------------------------------------------------------
 RUN_MODE = 'async'  # set to 'async' to enable asynchronous simulation
 PAUSE_DURING_UNLEARN = True
-STALENESS_LAMBDA = 0.1
-UNLEARN_PRIORITY_GAMMA = 1.5
+STALENESS_LAMBDA = 0.3
 SIM_MIN_SLEEP = 0.0
 SIM_MAX_SLEEP = 0.2
 ASYNC_SNAPSHOT_KEEP = 20
@@ -114,6 +113,15 @@ class AsyncServer:
                 'active': True
             }
             self.last_client_models[client_id] = copy.deepcopy(self.global_model.state_dict())
+
+    def deregister_client(self, client_id):
+        with self.lock:
+            if client_id in self.client_status:
+                del self.client_status[client_id]
+            if client_id in self.last_client_models:
+                del self.last_client_models[client_id]
+            self.num_clients = max(0, self.num_clients - 1)
+            logging.info(f"[SERVER] Client {client_id} deregistered; active clients={self.num_clients}")
 
     def enqueue_update(self, update):
         self.update_queue.put(update)
@@ -222,7 +230,6 @@ class AsyncServer:
     def _apply_unlearn(self, payload):
         state_dict = payload['state_dict']
         mode = payload.get('mode', 'replace')
-        priority_gamma = payload.get('priority_gamma', 1.0)
 
         with self.lock:
             if mode == 'replace':
@@ -233,7 +240,6 @@ class AsyncServer:
             self.global_version += 1
             self.total_updates += 1
             self.save_snapshot(self.global_version, self.global_model.state_dict())
-            logging.info(f"[unlearn] priority gamma={priority_gamma} applied")
             logging.info(f"[EVENT] Unlearning done -> global_version={self.global_version} ({mode})")
 
             for client_id in self.client_status:
@@ -311,19 +317,16 @@ class ClientSimulator:
 
 class UnlearnWorker(threading.Thread):
     def __init__(self, server, target_client_id, trainloader, num_local_epochs=5,
-                 lr=0.01, distance_threshold=2.2, clip_grad=5, mode='replace',
-                 priority_gamma=1.0, reference_version=None, testloader=None,
-                 testloader_poison=None):
+                 lr=0.01, clip_grad=5, mode='replace', reference_version=None,
+                 testloader=None, testloader_poison=None):
         super().__init__(daemon=True)
         self.server = server
         self.target_client_id = target_client_id
         self.trainloader = trainloader
         self.num_local_epochs = num_local_epochs
         self.lr = lr
-        self.distance_threshold = distance_threshold
         self.clip_grad = clip_grad
         self.mode = mode
-        self.priority_gamma = priority_gamma
         self.reference_version = reference_version
         self.testloader = testloader
         self.testloader_poison = testloader_poison
@@ -359,11 +362,8 @@ class UnlearnWorker(threading.Thread):
         opt = torch.optim.SGD(model.parameters(), lr=self.lr, momentum=0.9)
 
         model.train()
-        flag = False
         for epoch in range(self.num_local_epochs):
             logging.info(f'------------ {epoch}')
-            if flag:
-                break
             for batch_id, (x_batch, y_batch) in enumerate(self.trainloader):
                 x_batch = x_batch.to(device)
                 y_batch = y_batch.to(device)
@@ -389,15 +389,10 @@ class UnlearnWorker(threading.Thread):
                 distance_ref_party_0 = Utils.get_distance(model, erased_model)
                 logging.info(f'Distance from the unlearned model to party 0: {distance_ref_party_0}')
 
-                if distance_ref_party_0 > self.distance_threshold:
-                    flag = True
-                    break
-
         unlearned_model_state = copy.deepcopy(model.state_dict())
         self.server.enqueue_unlearn_result({
             'state_dict': unlearned_model_state,
             'mode': self.mode,
-            'priority_gamma': self.priority_gamma,
             'reference_version': ref_version
         })
 
@@ -589,7 +584,6 @@ if RUN_MODE == 'sync':
     num_updates_in_epoch = None
     num_local_epochs_unlearn = 5
     lr = 0.01
-    distance_threshold = 2.2
     clip_grad = 5
 
 
@@ -652,11 +646,8 @@ if RUN_MODE == 'sync':
         opt = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9)
 
         model.train()
-        flag = False
         for epoch in range(num_local_epochs_unlearn):
             print('------------', epoch)
-            if flag:
-                break
             for batch_id, (x_batch, y_batch) in enumerate(trainloader_lst[party_to_be_erased]):
 
                 x_batch = x_batch.to(device)
@@ -683,10 +674,6 @@ if RUN_MODE == 'sync':
 
                 distance_ref_party_0 = Utils.get_distance(model, party0_model)
                 print('Distance from the unlearned model to party 0:', distance_ref_party_0.item())
-
-                if distance_ref_party_0 > distance_threshold:
-                    flag = True
-                    break
 
                 if num_updates_in_epoch is not None and batch_id >= num_updates_in_epoch:
                     break
@@ -827,6 +814,7 @@ else:
 
     unlearn_triggered = False
     reference_version = None
+    erased_client_removed = False
 
     try:
         while server.global_version < ASYNC_MAX_VERSION:
@@ -847,16 +835,29 @@ else:
                                        trainloader=trainloader_lst[party_to_be_erased],
                                        num_local_epochs=5,
                                        lr=0.01,
-                                       distance_threshold=2.2,
                                        clip_grad=5,
                                        mode='replace',
-                                       priority_gamma=UNLEARN_PRIORITY_GAMMA,
                                        reference_version=reference_version,
                                        testloader=testloader,
                                        testloader_poison=testloader_poison)
                 worker.start()
                 worker.join()
                 server.wait_for_unlearn_completion()
+
+                if not erased_client_removed:
+                    erased_index = None
+                    for idx, client in enumerate(clients):
+                        if client.client_id == party_to_be_erased:
+                            client.stop()
+                            erased_index = idx
+                            break
+                    if erased_index is not None:
+                        clients.pop(erased_index)
+                        server.deregister_client(party_to_be_erased)
+                        erased_client_removed = True
+                        logging.info(f"[SERVER] Client {party_to_be_erased} removed post-unlearning")
+                    else:
+                        logging.warning(f"[SERVER] Target client {party_to_be_erased} not found during removal")
 
                 if PAUSE_DURING_UNLEARN:
                     for client in clients:
