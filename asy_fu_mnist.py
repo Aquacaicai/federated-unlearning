@@ -6,6 +6,9 @@ import random
 import threading
 import time
 from collections import deque
+import sys
+import logging
+from datetime import datetime
 
 import numpy as np
 import torch
@@ -35,7 +38,7 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 # -----------------------------------------------------------------------------
 # Global configuration for async experimentation
 # -----------------------------------------------------------------------------
-RUN_MODE = 'sync'  # set to 'async' to enable asynchronous simulation
+RUN_MODE = 'async'  # set to 'async' to enable asynchronous simulation
 PAUSE_DURING_UNLEARN = True
 STALENESS_LAMBDA = 0.1
 UNLEARN_PRIORITY_GAMMA = 1.5
@@ -124,7 +127,7 @@ class AsyncServer:
 
     def save_snapshot(self, version, state_dict):
         self.snapshots.append((version, copy.deepcopy(state_dict)))
-        print(f"[SNAPSHOT] model_ref(v_t={version}) saved")
+        logging.info(f"[SNAPSHOT] model_ref(v_t={version}) saved")
 
     def get_snapshot(self, version=None):
         with self.lock:
@@ -156,13 +159,13 @@ class AsyncServer:
         ref_vec = (num_clients / (num_clients - 1)) * global_vec - (1 / (num_clients - 1)) * erased_vec
 
         nn.utils.vector_to_parameters(ref_vec, ref_model.parameters())
-        print(f"[EVENT] model_ref computed for client {client_id} at version {snapshot_version}")
+        logging.info(f"[EVENT] model_ref computed for client {client_id} at version {snapshot_version}")
         return copy.deepcopy(ref_model.state_dict()), snapshot_version
 
     def begin_unlearning(self):
         self.is_unlearning = True
         self.unlearn_complete_event.clear()
-        print(f"[EVENT] Unlearning started (ref v_t={self.global_version})")
+        logging.info(f"[EVENT] Unlearning started (ref v_t={self.global_version})")
 
     def wait_for_update_queue(self):
         self.update_queue.join()
@@ -214,7 +217,7 @@ class AsyncServer:
             }
             self.last_client_models[client_id] = copy.deepcopy(client_state)
             self.save_snapshot(self.global_version, self.global_model.state_dict())
-            print(f"[SERVER] version={self.global_version} | updates={self.total_updates} | staleness={staleness} | w={weight:.2f}")
+            logging.info(f"[SERVER] version={self.global_version} | updates={self.total_updates} | staleness={staleness} | w={weight:.2f}")
 
     def _apply_unlearn(self, payload):
         state_dict = payload['state_dict']
@@ -230,8 +233,8 @@ class AsyncServer:
             self.global_version += 1
             self.total_updates += 1
             self.save_snapshot(self.global_version, self.global_model.state_dict())
-            print(f"[unlearn] priority gamma={priority_gamma} applied")
-            print(f"[EVENT] Unlearning done -> global_version={self.global_version} ({mode})")
+            logging.info(f"[unlearn] priority gamma={priority_gamma} applied")
+            logging.info(f"[EVENT] Unlearning done -> global_version={self.global_version} ({mode})")
 
             for client_id in self.client_status:
                 self.client_status[client_id]['local_version'] = self.global_version
@@ -302,7 +305,7 @@ class ClientSimulator:
 
             self.server.enqueue_update(update_payload)
             delay = random.uniform(self.compute_speed[0], self.compute_speed[1])
-            print(f"[CLIENT {self.client_id}] local_version={self.local_version} | delay={delay:.2f}s")
+            logging.info(f"[CLIENT {self.client_id}] local_version={self.local_version} | delay={delay:.2f}s")
             time.sleep(delay)
 
 
@@ -338,18 +341,18 @@ class UnlearnWorker(threading.Thread):
         if self.testloader is not None and self.testloader_poison is not None:
             eval_model = copy.deepcopy(model_ref)
             unlearn_clean_acc = Utils.evaluate(self.testloader, eval_model)
-            print(f'Clean Accuracy for Reference Model = {unlearn_clean_acc}')
+            logging.info(f'Clean Accuracy for Reference Model = {unlearn_clean_acc}')
             unlearn_pois_acc = Utils.evaluate(self.testloader_poison, eval_model)
-            print(f'Backdoor Accuracy for Reference Model = {unlearn_pois_acc}')
+            logging.info(f'Backdoor Accuracy for Reference Model = {unlearn_pois_acc}')
 
         dist_ref_random_lst = []
         for _ in range(10):
             dist_ref_random_lst.append(Utils.get_distance(model_ref, FLNet().to(device)))
         threshold = np.mean(dist_ref_random_lst) / 3
         dist_ref_party = Utils.get_distance(model_ref, erased_model)
-        print(f'Mean distance of Reference Model to random: {np.mean(dist_ref_random_lst)}')
-        print(f'Radius for model_ref: {threshold}')
-        print(f'Distance of Reference Model to party0_model: {dist_ref_party}')
+        logging.info(f'Mean distance of Reference Model to random: {np.mean(dist_ref_random_lst)}')
+        logging.info(f'Radius for model_ref: {threshold}')
+        logging.info(f'Distance of Reference Model to party0_model: {dist_ref_party}')
 
         model = copy.deepcopy(model_ref)
         criterion = nn.CrossEntropyLoss()
@@ -358,7 +361,7 @@ class UnlearnWorker(threading.Thread):
         model.train()
         flag = False
         for epoch in range(self.num_local_epochs):
-            print('------------', epoch)
+            logging.info(f'------------ {epoch}')
             if flag:
                 break
             for batch_id, (x_batch, y_batch) in enumerate(self.trainloader):
@@ -384,7 +387,7 @@ class UnlearnWorker(threading.Thread):
                         nn.utils.vector_to_parameters(proj_vec, model.parameters())
 
                 distance_ref_party_0 = Utils.get_distance(model, erased_model)
-                print('Distance from the unlearned model to party 0:', distance_ref_party_0.item())
+                logging.info(f'Distance from the unlearned model to party 0: {distance_ref_party_0}')
 
                 if distance_ref_party_0 > self.distance_threshold:
                     flag = True
@@ -769,6 +772,19 @@ if RUN_MODE == 'sync':
     plt.legend()
     plt.show()
 else:
+    # Setup logging
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_filename = f'federated-unlearning/doc/logs/async_unlearning_log_{timestamp}.log'
+    
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(message)s',
+        handlers=[
+            logging.FileHandler(log_filename),
+            logging.StreamHandler(sys.stdout)
+        ]
+    )
+
     async_initial_model = FLNet().to(device)
     server = AsyncServer(async_initial_model.state_dict(), num_parties,
                          pause_during_unlearn=PAUSE_DURING_UNLEARN,
@@ -791,7 +807,7 @@ else:
                                  compute_speed=(min_delay, max_delay))
         clients.append(client)
         client.start()
-        print(f"[CLIENT {client_id}] compute_speed=({min_delay:.2f}, {max_delay:.2f})")
+        logging.info(f"[CLIENT {client_id}] compute_speed=({min_delay:.2f}, {max_delay:.2f})")
 
     eval_versions = []
     clean_history = []
@@ -803,7 +819,7 @@ else:
     eval_model.load_state_dict(init_state)
     init_clean = Utils.evaluate(testloader, eval_model)
     init_pois = Utils.evaluate(testloader_poison, eval_model)
-    print(f"[ASYNC-EVAL] version={init_version} | Clean={init_clean} | Backdoor={init_pois}")
+    logging.info(f"[ASYNC-EVAL] version={init_version} | Clean={init_clean} | Backdoor={init_pois}")
     eval_versions.append(init_version)
     clean_history.append(init_clean)
     poison_history.append(init_pois)
@@ -846,7 +862,7 @@ else:
                     for client in clients:
                         client.resume()
 
-                print("[SERVER] Resumed async updates")
+                logging.info("[SERVER] Resumed async updates")
                 unlearn_triggered = True
 
             if current_version % ASYNC_EVAL_INTERVAL == 0 and current_version not in recorded_versions:
@@ -855,7 +871,7 @@ else:
                 eval_model.load_state_dict(snapshot_state)
                 clean_acc = Utils.evaluate(testloader, eval_model)
                 pois_acc = Utils.evaluate(testloader_poison, eval_model)
-                print(f"[ASYNC-EVAL] version={snapshot_version} | Clean={clean_acc} | Backdoor={pois_acc}")
+                logging.info(f"[ASYNC-EVAL] version={snapshot_version} | Clean={clean_acc} | Backdoor={pois_acc}")
                 eval_versions.append(snapshot_version)
                 clean_history.append(clean_acc)
                 poison_history.append(pois_acc)
@@ -876,4 +892,9 @@ else:
     plt.ylabel('Accuracy')
     plt.grid()
     plt.legend()
+    
+    plot_filename = f'federated-unlearning/doc/images/async_unlearning_plot_{timestamp}.png'
+    plt.savefig(plot_filename)
+    logging.info(f"Plot saved to {plot_filename}")
+    
     plt.show()
