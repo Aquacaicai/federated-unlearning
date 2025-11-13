@@ -1,26 +1,402 @@
+import copy
+import itertools
+import math
+import queue
+import random
+import threading
+import time
+from collections import deque
+
+import numpy as np
 import torch
 from torch import nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset, TensorDataset
-import numpy as np
 
 import matplotlib
 import matplotlib.pyplot as plt
 
-import copy
-import itertools
-import math
+import art
+from art.attacks.poisoning import PoisoningAttackBackdoor, PoisoningAttackCleanLabelBackdoor
+from art.attacks.poisoning.perturbations import add_pattern_bd
+from art.utils import load_mnist, preprocess, to_categorical
 
 from utils.model import FLNet
 from utils.local_train import LocalTraining
 from utils.utils import Utils
-from utils.fusion import Fusion, FusionAvg, FusionRetrain
+from utils.fusion import FusionAvg, FusionRetrain
 
 #seeds
 torch.manual_seed(0)
 np.random.seed(0)
 
-device = torch.device('cuda')
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+# -----------------------------------------------------------------------------
+# Global configuration for async experimentation
+# -----------------------------------------------------------------------------
+RUN_MODE = 'sync'  # set to 'async' to enable asynchronous simulation
+PAUSE_DURING_UNLEARN = True
+STALENESS_LAMBDA = 0.1
+UNLEARN_PRIORITY_GAMMA = 1.5
+SIM_MIN_SLEEP = 0.0
+SIM_MAX_SLEEP = 0.2
+ASYNC_SNAPSHOT_KEEP = 20
+ASYNC_EVAL_INTERVAL = 5
+ASYNC_MAX_VERSION = 50
+ASYNC_UNLEARN_TRIGGER = 25
+
+
+def clone_state_dict(state_dict):
+    return {k: v.clone().detach() for k, v in state_dict.items()}
+
+
+def subtract_state_dict(state_a, state_b):
+    return {k: state_a[k] - state_b[k] for k in state_a}
+
+
+class FusionAsync:
+    """Simple asynchronous fusion applying weighted parameter deltas."""
+
+    def apply_update(self, model, delta_state, weight):
+        with torch.no_grad():
+            for name, param in model.state_dict().items():
+                param.add_(weight * delta_state[name].to(param.device))
+
+
+class AsyncServer:
+    """Server coordinating asynchronous updates and unlearning tasks."""
+
+    def __init__(self, initial_state, num_clients, pause_during_unlearn=True,
+                 staleness_lambda=0.1, snapshot_keep=10):
+        self.global_model = FLNet().to(device)
+        self.global_model.load_state_dict(copy.deepcopy(initial_state))
+        self.global_version = 0
+        self.total_updates = 0
+        self.num_clients = num_clients
+        self.pause_during_unlearn = pause_during_unlearn
+        self.staleness_lambda = staleness_lambda
+        self.fusion = FusionAsync()
+
+        self.client_status = {}
+        self.last_client_models = {}
+        self.update_queue = queue.Queue()
+        self.unlearn_queue = queue.Queue()
+        self.snapshots = deque(maxlen=snapshot_keep)
+        self.lock = threading.Lock()
+        self.stop_event = threading.Event()
+        self.is_unlearning = False
+        self.unlearn_complete_event = threading.Event()
+        self.processing_thread = None
+
+        self.save_snapshot(self.global_version, copy.deepcopy(self.global_model.state_dict()))
+
+    def start(self):
+        if self.processing_thread is not None:
+            return
+        self.processing_thread = threading.Thread(target=self._process_loop, daemon=True)
+        self.processing_thread.start()
+
+    def stop(self):
+        self.stop_event.set()
+        if self.processing_thread is not None:
+            self.processing_thread.join()
+            self.processing_thread = None
+
+    def register_client(self, client_id):
+        with self.lock:
+            self.client_status[client_id] = {
+                'local_version': self.global_version,
+                'staleness': 0,
+                'active': True
+            }
+            self.last_client_models[client_id] = copy.deepcopy(self.global_model.state_dict())
+
+    def enqueue_update(self, update):
+        self.update_queue.put(update)
+
+    def enqueue_unlearn_result(self, payload):
+        self.unlearn_queue.put(payload)
+
+    def get_latest_model(self):
+        with self.lock:
+            return copy.deepcopy(self.global_model.state_dict()), self.global_version
+
+    def save_snapshot(self, version, state_dict):
+        self.snapshots.append((version, copy.deepcopy(state_dict)))
+        print(f"[SNAPSHOT] model_ref(v_t={version}) saved")
+
+    def get_snapshot(self, version=None):
+        with self.lock:
+            if version is None:
+                return copy.deepcopy(self.global_model.state_dict()), self.global_version
+            for v, state in reversed(self.snapshots):
+                if v == version:
+                    return copy.deepcopy(state), v
+            latest_state, latest_version = self.snapshots[-1]
+            return copy.deepcopy(latest_state), latest_version
+
+    def get_client_model(self, client_id):
+        with self.lock:
+            return copy.deepcopy(self.last_client_models.get(client_id, self.global_model.state_dict()))
+
+    def compute_model_ref(self, client_id, version=None):
+        snapshot_state, snapshot_version = self.get_snapshot(version)
+        erased_state = self.get_client_model(client_id)
+
+        ref_model = FLNet().to(device)
+        ref_model.load_state_dict(copy.deepcopy(snapshot_state))
+        erased_model = FLNet().to(device)
+        erased_model.load_state_dict(copy.deepcopy(erased_state))
+
+        global_vec = nn.utils.parameters_to_vector(ref_model.parameters())
+        erased_vec = nn.utils.parameters_to_vector(erased_model.parameters())
+
+        num_clients = max(2, self.num_clients)
+        ref_vec = (num_clients / (num_clients - 1)) * global_vec - (1 / (num_clients - 1)) * erased_vec
+
+        nn.utils.vector_to_parameters(ref_vec, ref_model.parameters())
+        print(f"[EVENT] model_ref computed for client {client_id} at version {snapshot_version}")
+        return copy.deepcopy(ref_model.state_dict()), snapshot_version
+
+    def begin_unlearning(self):
+        self.is_unlearning = True
+        self.unlearn_complete_event.clear()
+        print(f"[EVENT] Unlearning started (ref v_t={self.global_version})")
+
+    def wait_for_update_queue(self):
+        self.update_queue.join()
+
+    def wait_for_unlearn_completion(self):
+        self.unlearn_complete_event.wait()
+
+    def _process_loop(self):
+        while not self.stop_event.is_set():
+            processed = False
+            try:
+                payload = self.unlearn_queue.get_nowait()
+                self._apply_unlearn(payload)
+                self.unlearn_queue.task_done()
+                processed = True
+            except queue.Empty:
+                pass
+
+            if processed:
+                continue
+
+            if self.is_unlearning:
+                time.sleep(0.05)
+                continue
+
+            try:
+                update = self.update_queue.get(timeout=0.1)
+                self._apply_update(update)
+                self.update_queue.task_done()
+            except queue.Empty:
+                continue
+
+    def _apply_update(self, update):
+        client_id = update['client_id']
+        version_seen = update['version_seen']
+        delta_state = update['delta']
+        client_state = update['client_state']
+
+        with self.lock:
+            staleness = max(0, self.global_version - version_seen)
+            weight = math.exp(-self.staleness_lambda * staleness)
+            self.fusion.apply_update(self.global_model, delta_state, weight)
+            self.global_version += 1
+            self.total_updates += 1
+            self.client_status[client_id] = {
+                'local_version': self.global_version,
+                'staleness': staleness,
+                'active': True
+            }
+            self.last_client_models[client_id] = copy.deepcopy(client_state)
+            self.save_snapshot(self.global_version, self.global_model.state_dict())
+            print(f"[SERVER] version={self.global_version} | updates={self.total_updates} | staleness={staleness} | w={weight:.2f}")
+
+    def _apply_unlearn(self, payload):
+        state_dict = payload['state_dict']
+        mode = payload.get('mode', 'replace')
+        priority_gamma = payload.get('priority_gamma', 1.0)
+
+        with self.lock:
+            if mode == 'replace':
+                self.global_model.load_state_dict(copy.deepcopy(state_dict))
+            else:
+                raise ValueError(f"Unsupported unlearn fusion mode: {mode}")
+
+            self.global_version += 1
+            self.total_updates += 1
+            self.save_snapshot(self.global_version, self.global_model.state_dict())
+            print(f"[unlearn] priority gamma={priority_gamma} applied")
+            print(f"[EVENT] Unlearning done -> global_version={self.global_version} ({mode})")
+
+            for client_id in self.client_status:
+                self.client_status[client_id]['local_version'] = self.global_version
+
+            self.is_unlearning = False
+            self.unlearn_complete_event.set()
+
+
+class ClientSimulator:
+    def __init__(self, client_id, trainloader, server, num_local_epochs=1,
+                 num_updates_in_epoch=None, compute_speed=(0.0, 0.2)):
+        self.client_id = client_id
+        self.trainloader = trainloader
+        self.server = server
+        self.local_training = LocalTraining(num_updates_in_epoch=num_updates_in_epoch,
+                                            num_local_epochs=num_local_epochs)
+        self.compute_speed = compute_speed
+        self.local_version = 0
+        self.active_event = threading.Event()
+        self.active_event.set()
+        self.stop_event = threading.Event()
+        self.thread = None
+
+    def start(self):
+        if self.thread is not None:
+            return
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def stop(self):
+        self.stop_event.set()
+        if self.thread is not None:
+            self.thread.join()
+            self.thread = None
+
+    def pause(self):
+        self.active_event.clear()
+
+    def resume(self):
+        self.active_event.set()
+
+    def _run(self):
+        while not self.stop_event.is_set():
+            if not self.active_event.is_set():
+                time.sleep(0.05)
+                continue
+
+            global_state, global_version = self.server.get_latest_model()
+            model = FLNet().to(device)
+            model.load_state_dict(copy.deepcopy(global_state))
+            self.local_version = global_version
+
+            initial_state = copy.deepcopy(model.state_dict())
+            model_update, loss = self.local_training.train(model=model,
+                                                           trainloader=self.trainloader,
+                                                           criterion=None, opt=None)
+            updated_state = copy.deepcopy(model_update.state_dict())
+            delta_state = subtract_state_dict(updated_state, initial_state)
+
+            update_payload = {
+                'client_id': self.client_id,
+                'delta': clone_state_dict(delta_state),
+                'client_state': copy.deepcopy(updated_state),
+                'version_seen': global_version,
+                'flag': 'update',
+                'timestamp': time.time()
+            }
+
+            self.server.enqueue_update(update_payload)
+            delay = random.uniform(self.compute_speed[0], self.compute_speed[1])
+            print(f"[CLIENT {self.client_id}] local_version={self.local_version} | delay={delay:.2f}s")
+            time.sleep(delay)
+
+
+class UnlearnWorker(threading.Thread):
+    def __init__(self, server, target_client_id, trainloader, num_local_epochs=5,
+                 lr=0.01, distance_threshold=2.2, clip_grad=5, mode='replace',
+                 priority_gamma=1.0, reference_version=None, testloader=None,
+                 testloader_poison=None):
+        super().__init__(daemon=True)
+        self.server = server
+        self.target_client_id = target_client_id
+        self.trainloader = trainloader
+        self.num_local_epochs = num_local_epochs
+        self.lr = lr
+        self.distance_threshold = distance_threshold
+        self.clip_grad = clip_grad
+        self.mode = mode
+        self.priority_gamma = priority_gamma
+        self.reference_version = reference_version
+        self.testloader = testloader
+        self.testloader_poison = testloader_poison
+
+    def run(self):
+        model_ref_state, ref_version = self.server.compute_model_ref(self.target_client_id,
+                                                                     version=self.reference_version)
+        model_ref = FLNet().to(device)
+        model_ref.load_state_dict(copy.deepcopy(model_ref_state))
+
+        erased_model_state = self.server.get_client_model(self.target_client_id)
+        erased_model = FLNet().to(device)
+        erased_model.load_state_dict(copy.deepcopy(erased_model_state))
+
+        if self.testloader is not None and self.testloader_poison is not None:
+            eval_model = copy.deepcopy(model_ref)
+            unlearn_clean_acc = Utils.evaluate(self.testloader, eval_model)
+            print(f'Clean Accuracy for Reference Model = {unlearn_clean_acc}')
+            unlearn_pois_acc = Utils.evaluate(self.testloader_poison, eval_model)
+            print(f'Backdoor Accuracy for Reference Model = {unlearn_pois_acc}')
+
+        dist_ref_random_lst = []
+        for _ in range(10):
+            dist_ref_random_lst.append(Utils.get_distance(model_ref, FLNet().to(device)))
+        threshold = np.mean(dist_ref_random_lst) / 3
+        dist_ref_party = Utils.get_distance(model_ref, erased_model)
+        print(f'Mean distance of Reference Model to random: {np.mean(dist_ref_random_lst)}')
+        print(f'Radius for model_ref: {threshold}')
+        print(f'Distance of Reference Model to party0_model: {dist_ref_party}')
+
+        model = copy.deepcopy(model_ref)
+        criterion = nn.CrossEntropyLoss()
+        opt = torch.optim.SGD(model.parameters(), lr=self.lr, momentum=0.9)
+
+        model.train()
+        flag = False
+        for epoch in range(self.num_local_epochs):
+            print('------------', epoch)
+            if flag:
+                break
+            for batch_id, (x_batch, y_batch) in enumerate(self.trainloader):
+                x_batch = x_batch.to(device)
+                y_batch = y_batch.to(device)
+                opt.zero_grad()
+
+                outputs = model(x_batch)
+                loss = criterion(outputs, y_batch)
+                loss_joint = -loss
+                loss_joint.backward()
+                if self.clip_grad > 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), self.clip_grad)
+
+                opt.step()
+
+                with torch.no_grad():
+                    distance = Utils.get_distance(model, model_ref)
+                    if distance > threshold:
+                        dist_vec = nn.utils.parameters_to_vector(model.parameters()) - nn.utils.parameters_to_vector(model_ref.parameters())
+                        dist_vec = dist_vec/torch.norm(dist_vec)*np.sqrt(threshold)
+                        proj_vec = nn.utils.parameters_to_vector(model_ref.parameters()) + dist_vec
+                        nn.utils.vector_to_parameters(proj_vec, model.parameters())
+
+                distance_ref_party_0 = Utils.get_distance(model, erased_model)
+                print('Distance from the unlearned model to party 0:', distance_ref_party_0.item())
+
+                if distance_ref_party_0 > self.distance_threshold:
+                    flag = True
+                    break
+
+        unlearned_model_state = copy.deepcopy(model.state_dict())
+        self.server.enqueue_unlearn_result({
+            'state_dict': unlearned_model_state,
+            'mode': self.mode,
+            'priority_gamma': self.priority_gamma,
+            'reference_version': ref_version
+        })
 
 def FL_round_fusion_selection(num_parties, fusion_key='FedAvg'):
 
@@ -40,12 +416,6 @@ num_samples_erased_party = int(60000 / num_parties * scale)
 num_samples_per_party = int((60000 - num_samples_erased_party)/(num_parties - 1))
 print('Number of samples erased party:', num_samples_erased_party)
 print('Number of samples other party:', num_samples_per_party)
-
-import numpy as np
-import art
-from art.attacks.poisoning import PoisoningAttackBackdoor, PoisoningAttackCleanLabelBackdoor
-from art.attacks.poisoning.perturbations import add_pattern_bd
-from art.utils import load_mnist, preprocess, to_categorical
 
 (x_raw, y_raw), (x_raw_test, y_raw_test), min_, max_ = load_mnist(raw=True)
 
@@ -82,11 +452,8 @@ for s,i in zip(selected_indices,range(len(selected_indices))):
     poisoned_x_train[s] = poisoned_data[i]
     poisoned_y_train[s] = int(np.argmax(poisoned_labels[i]))
 
-import matplotlib.pyplot as plt
 plt.imshow(poisoned_x_train[selected_indices[0]])
 print(poisoned_y_train[0])
-
-from torch.utils.data import DataLoader, Dataset, TensorDataset
 
 poisoned_x_train_ch = np.expand_dims(poisoned_x_train, axis = 1)
 print('poisoned_x_train_ch.shape:',poisoned_x_train_ch.shape)
@@ -136,269 +503,377 @@ print(y_test_pt.shape)
 dataset_test = TensorDataset(torch.Tensor(x_test_pt), torch.Tensor(y_test_pt).long())
 testloader = DataLoader(dataset_test, batch_size=1000, shuffle=False)
 
-num_of_repeats = 1
-num_fl_rounds = 10
+if RUN_MODE == 'sync':
+    num_of_repeats = 1
+    num_fl_rounds = 10
 
-fusion_types = ['FedAvg','Retrain']
-fusion_types_unlearn = ['Retrain', 'Unlearn']
+    fusion_types = ['FedAvg', 'Retrain']
+    fusion_types_unlearn = ['Retrain', 'Unlearn']
 
-num_updates_in_epoch = None
-num_local_epochs = 1 
+    num_updates_in_epoch = None
+    num_local_epochs = 1
 
-dist_Retrain = {}
-loss_fed = {}
-clean_accuracy = {}
-pois_accuracy = {}
-for fusion_key in fusion_types:
-    loss_fed[fusion_key] = np.zeros(num_fl_rounds)
-    clean_accuracy[fusion_key] = np.zeros(num_fl_rounds)
-    pois_accuracy[fusion_key] = np.zeros(num_fl_rounds)
-    if fusion_key != 'Retrain':
-        dist_Retrain[fusion_key] = np.zeros(num_fl_rounds)
+    dist_Retrain = {}
+    loss_fed = {}
+    clean_accuracy = {}
+    pois_accuracy = {}
+    for fusion_key in fusion_types:
+        loss_fed[fusion_key] = np.zeros(num_fl_rounds)
+        clean_accuracy[fusion_key] = np.zeros(num_fl_rounds)
+        pois_accuracy[fusion_key] = np.zeros(num_fl_rounds)
+        if fusion_key != 'Retrain':
+            dist_Retrain[fusion_key] = np.zeros(num_fl_rounds)
 
-party_models_dict = {}
+    party_models_dict = {}
 
-initial_model = FLNet().to(device)
-model_dict = {}
-for fusion_key in fusion_types:
-    model_dict[fusion_key] = copy.deepcopy(initial_model.state_dict())
+    initial_model = FLNet().to(device)
+    model_dict = {}
+    for fusion_key in fusion_types:
+        model_dict[fusion_key] = copy.deepcopy(initial_model.state_dict())
 
-for round_num in range(num_fl_rounds): 
-    local_training = LocalTraining(num_updates_in_epoch=num_updates_in_epoch, num_local_epochs=num_local_epochs)
+    for round_num in range(num_fl_rounds):
+        local_training = LocalTraining(num_updates_in_epoch=num_updates_in_epoch, num_local_epochs=num_local_epochs)
+
+        for fusion_key in fusion_types:
+            fusion = FL_round_fusion_selection(num_parties=num_parties, fusion_key=fusion_key)
+
+            current_model_state_dict = copy.deepcopy(model_dict[fusion_key])
+            current_model = copy.deepcopy(initial_model)
+            current_model.load_state_dict(current_model_state_dict)
+
+            ##################### Local Training Round #############################
+            party_models = []
+            party_losses = []
+            for party_id in range(num_parties):
+
+                if fusion_key == 'Retrain' and party_id == party_to_be_erased:
+                    party_models.append(FLNet().to(device))
+                else:
+                    model = copy.deepcopy(current_model)
+                    model_update, party_loss = local_training.train(model=model,
+                                                trainloader=trainloader_lst[party_id],
+                                                criterion=None, opt=None)
+
+                    party_models.append(copy.deepcopy(model_update))
+                    party_losses.append(party_loss)
+
+            loss_fed[fusion_key][round_num] += (np.mean(party_losses)/num_of_repeats)
+            ######################################################################
+
+            current_model_state_dict = fusion.fusion_algo(party_models=party_models, current_model=current_model)
+
+            model_dict[fusion_key] = copy.deepcopy(current_model_state_dict)
+            party_models_dict[fusion_key] = party_models
+
+            eval_model = FLNet().to(device)
+            eval_model.load_state_dict(current_model_state_dict)
+            clean_acc = Utils.evaluate(testloader, eval_model)
+            clean_accuracy[fusion_key][round_num] = clean_acc
+            print(f'Global Clean Accuracy {fusion_key}, round {round_num} = {clean_acc}')
+            pois_acc = Utils.evaluate(testloader_poison, eval_model)
+            pois_accuracy[fusion_key][round_num] = pois_acc
+            print(f'Global Backdoor Accuracy {fusion_key}, round {round_num} = {pois_acc}')
 
     for fusion_key in fusion_types:
-        fusion = FL_round_fusion_selection(num_parties=num_parties, fusion_key=fusion_key)
-
-        current_model_state_dict = copy.deepcopy(model_dict[fusion_key])
+        current_model_state_dict = model_dict[fusion_key]
         current_model = copy.deepcopy(initial_model)
         current_model.load_state_dict(current_model_state_dict)
+        clean_acc = Utils.evaluate(testloader, current_model)
+        print(f'Clean Accuracy {fusion_key}: {clean_acc}')
+        pois_acc = Utils.evaluate(testloader_poison, current_model)
+        print(f'Backdoor Accuracy {fusion_key}: {pois_acc}')
 
-        ##################### Local Training Round #############################
-        party_models = []
-        party_losses = []
-        for party_id in range(num_parties):
+    num_updates_in_epoch = None
+    num_local_epochs_unlearn = 5
+    lr = 0.01
+    distance_threshold = 2.2
+    clip_grad = 5
 
-            if fusion_key == 'Retrain' and party_id == party_to_be_erased:
-                party_models.append(FLNet().to(device))
-            else:
+
+    initial_model = FLNet().to(device)
+    unlearned_model_dict = {}
+    for fusion_key in fusion_types_unlearn:
+        if fusion_key == 'Retrain':
+            unlearned_model_dict[fusion_key] = copy.deepcopy(initial_model.state_dict())
+
+    clean_accuracy_unlearn = {}
+    pois_accuracy_unlearn = {}
+    for fusion_key in fusion_types_unlearn:
+        clean_accuracy_unlearn[fusion_key] = 0
+        pois_accuracy_unlearn[fusion_key] = 0
+
+    for fusion_key in fusion_types:
+        if fusion_key == 'Retrain':
+            continue
+
+        initial_model = FLNet().to(device)
+        fedavg_model_state_dict = copy.deepcopy(model_dict[fusion_key])
+        fedavg_model = copy.deepcopy(initial_model)
+        fedavg_model.load_state_dict(fedavg_model_state_dict)
+
+        party_models = copy.deepcopy(party_models_dict[fusion_key])
+        party0_model = copy.deepcopy(party_models[0])
+
+        #compute reference model
+        #w_ref = N/(N-1)w^T - 1/(N-1)w^{T-1}_i = \sum{i \ne j}w_j^{T-1}
+        model_ref_vec = num_parties / (num_parties - 1) * nn.utils.parameters_to_vector(fedavg_model.parameters()) \
+                                   - 1 / (num_parties - 1) * nn.utils.parameters_to_vector(party0_model.parameters())
+
+        #compute threshold
+        model_ref = copy.deepcopy(initial_model)
+        nn.utils.vector_to_parameters(model_ref_vec, model_ref.parameters())
+
+        eval_model = copy.deepcopy(model_ref)
+        unlearn_clean_acc = Utils.evaluate(testloader, eval_model)
+        print(f'Clean Accuracy for Reference Model = {unlearn_clean_acc}')
+        unlearn_pois_acc = Utils.evaluate(testloader_poison, eval_model)
+        print(f'Backdoor Accuracy for Reference Model = {unlearn_pois_acc}')
+
+        dist_ref_random_lst = []
+        for _ in range(10):
+            dist_ref_random_lst.append(Utils.get_distance(model_ref, FLNet().to(device)))
+
+        print(f'Mean distance of Reference Model to random: {np.mean(dist_ref_random_lst)}')
+        threshold = np.mean(dist_ref_random_lst) / 3
+        print(f'Radius for model_ref: {threshold}')
+        dist_ref_party = Utils.get_distance(model_ref, party0_model)
+        print(f'Distance of Reference Model to party0_model: {dist_ref_party}')
+
+
+        ###############################################################
+        #### Unlearning
+        ###############################################################
+        model = copy.deepcopy(model_ref)
+
+        criterion = nn.CrossEntropyLoss()
+        opt = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9)
+
+        model.train()
+        flag = False
+        for epoch in range(num_local_epochs_unlearn):
+            print('------------', epoch)
+            if flag:
+                break
+            for batch_id, (x_batch, y_batch) in enumerate(trainloader_lst[party_to_be_erased]):
+
+                x_batch = x_batch.to(device)
+                y_batch = y_batch.to(device)
+                opt.zero_grad()
+
+                outputs = model(x_batch)
+                loss = criterion(outputs, y_batch)
+                loss_joint = -loss # negate the loss for gradient ascent
+                loss_joint.backward()
+                if clip_grad > 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad)
+
+                opt.step()
+
+                with torch.no_grad():
+                    distance = Utils.get_distance(model, model_ref)
+                    if distance > threshold:
+                        dist_vec = nn.utils.parameters_to_vector(model.parameters()) - nn.utils.parameters_to_vector(model_ref.parameters())
+                        dist_vec = dist_vec/torch.norm(dist_vec)*np.sqrt(threshold)
+                        proj_vec = nn.utils.parameters_to_vector(model_ref.parameters()) + dist_vec
+                        nn.utils.vector_to_parameters(proj_vec, model.parameters())
+                        distance = Utils.get_distance(model, model_ref)
+
+                distance_ref_party_0 = Utils.get_distance(model, party0_model)
+                print('Distance from the unlearned model to party 0:', distance_ref_party_0.item())
+
+                if distance_ref_party_0 > distance_threshold:
+                    flag = True
+                    break
+
+                if num_updates_in_epoch is not None and batch_id >= num_updates_in_epoch:
+                    break
+        ####################################################################
+
+        unlearned_model = copy.deepcopy(model)
+        unlearned_model_dict[fusion_types_unlearn[1]] = unlearned_model.state_dict()
+
+        eval_model = FLNet().to(device)
+        eval_model.load_state_dict(unlearned_model_dict[fusion_types_unlearn[1]])
+        unlearn_clean_acc = Utils.evaluate(testloader, eval_model)
+        print(f'Clean Accuracy for UN-Local Model = {unlearn_clean_acc}')
+        clean_accuracy_unlearn[fusion_types_unlearn[1]] =  unlearn_clean_acc
+        pois_unlearn_acc = Utils.evaluate(testloader_poison, eval_model)
+        print(f'Backdoor Accuracy for UN-Local Model = {pois_unlearn_acc}')
+        pois_accuracy_unlearn[fusion_types_unlearn[1]] =  pois_unlearn_acc
+
+    num_fl_after_unlearn_rounds = num_fl_rounds
+    num_updates_in_epoch = 50
+    num_local_epochs = 1
+
+    clean_accuracy_unlearn_fl_after_unlearn = {}
+    pois_accuracy_unlearn_fl_after_unlearn = {}
+    loss_unlearn = {}
+    for fusion_key in fusion_types_unlearn:
+        clean_accuracy_unlearn_fl_after_unlearn[fusion_key] = np.zeros(num_fl_after_unlearn_rounds)
+        pois_accuracy_unlearn_fl_after_unlearn[fusion_key] = np.zeros(num_fl_after_unlearn_rounds)
+        loss_unlearn[fusion_key] = np.zeros(num_fl_after_unlearn_rounds)
+
+
+    for round_num in range(num_fl_after_unlearn_rounds):
+
+        local_training = LocalTraining(num_updates_in_epoch=num_updates_in_epoch, num_local_epochs=num_local_epochs)
+
+        for fusion_key in fusion_types_unlearn:
+            # Reduce num_parties by 1 to remove the erased party
+            fusion = FL_round_fusion_selection(num_parties=num_parties - 1, fusion_key=fusion_key)
+
+            current_model_state_dict = copy.deepcopy(unlearned_model_dict[fusion_key])
+            current_model = FLNet().to(device)
+            current_model.load_state_dict(current_model_state_dict)
+
+            ##################### Local Training Round #############################
+            party_models = []
+            party_losses = []
+            for party_id in range(1, num_parties):
                 model = copy.deepcopy(current_model)
-                model_update, party_loss = local_training.train(model=model, 
-                                            trainloader=trainloader_lst[party_id], 
+                model_update, party_loss = local_training.train(model=model,
+                                            trainloader=trainloader_lst[party_id],
                                             criterion=None, opt=None)
 
                 party_models.append(copy.deepcopy(model_update))
                 party_losses.append(party_loss)
 
-        loss_fed[fusion_key][round_num] += (np.mean(party_losses)/num_of_repeats)
-        ######################################################################
+            loss_unlearn[fusion_key][round_num] = np.mean(party_losses)
+            ######################################################################
 
-        current_model_state_dict = fusion.fusion_algo(party_models=party_models, current_model=current_model)
+            current_model_state_dict = fusion.fusion_algo(party_models=party_models, current_model=current_model)
+            unlearned_model_dict[fusion_key] = copy.deepcopy(current_model_state_dict)
+            party_models_dict[fusion_key] = party_models
 
-        model_dict[fusion_key] = copy.deepcopy(current_model_state_dict)
-        party_models_dict[fusion_key] = party_models  
-
-        eval_model = FLNet().to(device)
-        eval_model.load_state_dict(current_model_state_dict)
-        clean_acc = Utils.evaluate(testloader, eval_model)
-        clean_accuracy[fusion_key][round_num] = clean_acc
-        print(f'Global Clean Accuracy {fusion_key}, round {round_num} = {clean_acc}')
-        pois_acc = Utils.evaluate(testloader_poison, eval_model)
-        pois_accuracy[fusion_key][round_num] = pois_acc
-        print(f'Global Backdoor Accuracy {fusion_key}, round {round_num} = {pois_acc}')
-
-for fusion_key in fusion_types:
-    current_model_state_dict = model_dict[fusion_key]
-    current_model = copy.deepcopy(initial_model)
-    current_model.load_state_dict(current_model_state_dict)
-    clean_acc = Utils.evaluate(testloader, current_model)
-    print(f'Clean Accuracy {fusion_key}: {clean_acc}')
-    pois_acc = Utils.evaluate(testloader_poison, current_model)
-    print(f'Backdoor Accuracy {fusion_key}: {pois_acc}')
-
-num_updates_in_epoch = None  
-num_local_epochs_unlearn = 5 
-lr = 0.01
-distance_threshold = 2.2
-clip_grad = 5
+            eval_model = FLNet().to(device)
+            eval_model.load_state_dict(current_model_state_dict)
+            unlearn_clean_acc = Utils.evaluate(testloader, eval_model)
+            print(f'Global Clean Accuracy {fusion_key}, round {round_num} = {unlearn_clean_acc}')
+            clean_accuracy_unlearn_fl_after_unlearn[fusion_key][round_num] = unlearn_clean_acc
+            unlearn_pois_acc = Utils.evaluate(testloader_poison, eval_model)
+            print(f'Global Backdoor Accuracy {fusion_key}, round {round_num} = {unlearn_pois_acc}')
+            pois_accuracy_unlearn_fl_after_unlearn[fusion_key][round_num] = unlearn_pois_acc
 
 
-initial_model = FLNet().to(device)
-unlearned_model_dict = {}
-for fusion_key in fusion_types_unlearn:
-    if fusion_key == 'Retrain':
-        unlearned_model_dict[fusion_key] = copy.deepcopy(initial_model.state_dict())
+    fl_rounds = [i for i in range(1, num_fl_rounds + 1)]
 
-clean_accuracy_unlearn = {}
-pois_accuracy_unlearn = {}
-for fusion_key in fusion_types_unlearn:
-    clean_accuracy_unlearn[fusion_key] = 0
-    pois_accuracy_unlearn[fusion_key] = 0
+    plt.plot(fl_rounds, clean_accuracy_unlearn_fl_after_unlearn['Unlearn'], 'ro--', linewidth=2, markersize=12, label='UN-Clean Acc')
+    plt.plot(fl_rounds, pois_accuracy_unlearn_fl_after_unlearn['Unlearn'], 'gx--', linewidth=2, markersize=12, label='UN-Backdoor Acc')
+    plt.plot(fl_rounds, clean_accuracy_unlearn_fl_after_unlearn['Retrain'], 'm^-', linewidth=2, markersize=12, label='Retrain-Clean Acc')
+    plt.plot(fl_rounds, pois_accuracy_unlearn_fl_after_unlearn['Retrain'], 'c+-', linewidth=2, markersize=12, label='Retrain-Backdoor Acc')
+    plt.xlabel('Training Rounds')
+    plt.ylabel('Accuracy')
+    plt.grid()
+    plt.ylim([0, 100])
+    plt.xlim([1, 10])
+    plt.legend()
+    plt.show()
+else:
+    async_initial_model = FLNet().to(device)
+    server = AsyncServer(async_initial_model.state_dict(), num_parties,
+                         pause_during_unlearn=PAUSE_DURING_UNLEARN,
+                         staleness_lambda=STALENESS_LAMBDA,
+                         snapshot_keep=ASYNC_SNAPSHOT_KEEP)
+    server.start()
 
-for fusion_key in fusion_types:
-    if fusion_key == 'Retrain':
-        continue
+    clients = []
+    speed_factors = np.linspace(1.0, 1.0 + 0.5 * (num_parties - 1), num_parties)
+    for client_id in range(num_parties):
+        server.register_client(client_id)
+        factor = speed_factors[client_id]
+        min_delay = SIM_MIN_SLEEP * factor
+        max_delay = max(min_delay + 0.01, SIM_MAX_SLEEP * factor + 0.01 * client_id)
+        client = ClientSimulator(client_id=client_id,
+                                 trainloader=trainloader_lst[client_id],
+                                 server=server,
+                                 num_local_epochs=1,
+                                 num_updates_in_epoch=None,
+                                 compute_speed=(min_delay, max_delay))
+        clients.append(client)
+        client.start()
+        print(f"[CLIENT {client_id}] compute_speed=({min_delay:.2f}, {max_delay:.2f})")
 
-    initial_model = FLNet().to(device)
-    fedavg_model_state_dict = copy.deepcopy(model_dict[fusion_key])
-    fedavg_model = copy.deepcopy(initial_model)
-    fedavg_model.load_state_dict(fedavg_model_state_dict)
+    eval_versions = []
+    clean_history = []
+    poison_history = []
+    recorded_versions = set()
 
-    party_models = copy.deepcopy(party_models_dict[fusion_key])
-    party0_model = copy.deepcopy(party_models[0])
-
-    #compute reference model
-    #w_ref = N/(N-1)w^T - 1/(N-1)w^{T-1}_i = \sum{i \ne j}w_j^{T-1}
-    model_ref_vec = num_parties / (num_parties - 1) * nn.utils.parameters_to_vector(fedavg_model.parameters()) \
-                               - 1 / (num_parties - 1) * nn.utils.parameters_to_vector(party0_model.parameters())
-
-    #compute threshold
-    model_ref = copy.deepcopy(initial_model)
-    nn.utils.vector_to_parameters(model_ref_vec, model_ref.parameters())
-
-    eval_model = copy.deepcopy(model_ref)
-    unlearn_clean_acc = Utils.evaluate(testloader, eval_model)
-    print(f'Clean Accuracy for Reference Model = {unlearn_clean_acc}')
-    unlearn_pois_acc = Utils.evaluate(testloader_poison, eval_model)
-    print(f'Backdoor Accuracy for Reference Model = {unlearn_pois_acc}')
-
-    dist_ref_random_lst = []
-    for _ in range(10):
-        dist_ref_random_lst.append(Utils.get_distance(model_ref, FLNet().to(device)))    
-
-    print(f'Mean distance of Reference Model to random: {np.mean(dist_ref_random_lst)}')
-    threshold = np.mean(dist_ref_random_lst) / 3
-    print(f'Radius for model_ref: {threshold}')
-    dist_ref_party = Utils.get_distance(model_ref, party0_model)
-    print(f'Distance of Reference Model to party0_model: {dist_ref_party}')
-
-
-    ###############################################################
-    #### Unlearning
-    ###############################################################
-    model = copy.deepcopy(model_ref)
-
-    criterion = nn.CrossEntropyLoss()
-    opt = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9) 
-
-    model.train()
-    flag = False
-    for epoch in range(num_local_epochs_unlearn):
-        print('------------', epoch)
-        if flag:
-            break
-        for batch_id, (x_batch, y_batch) in enumerate(trainloader_lst[party_to_be_erased]):
-
-            x_batch = x_batch.to(device)
-            y_batch = y_batch.to(device)
-            opt.zero_grad()
-
-            outputs = model(x_batch)
-            loss = criterion(outputs, y_batch)
-            loss_joint = -loss # negate the loss for gradient ascent
-            loss_joint.backward()
-            if clip_grad > 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad)
-
-            opt.step()
-
-            with torch.no_grad():
-                distance = Utils.get_distance(model, model_ref)
-                if distance > threshold:
-                    dist_vec = nn.utils.parameters_to_vector(model.parameters()) - nn.utils.parameters_to_vector(model_ref.parameters())
-                    dist_vec = dist_vec/torch.norm(dist_vec)*np.sqrt(threshold)
-                    proj_vec = nn.utils.parameters_to_vector(model_ref.parameters()) + dist_vec
-                    nn.utils.vector_to_parameters(proj_vec, model.parameters())
-                    distance = Utils.get_distance(model, model_ref)
-
-            distance_ref_party_0 = Utils.get_distance(model, party0_model)
-            print('Distance from the unlearned model to party 0:', distance_ref_party_0.item())
-
-            if distance_ref_party_0 > distance_threshold:
-                flag = True
-                break
-
-            if num_updates_in_epoch is not None and batch_id >= num_updates_in_epoch:
-                break
-    ####################################################################                           
-
-    unlearned_model = copy.deepcopy(model)
-    unlearned_model_dict[fusion_types_unlearn[1]] = unlearned_model.state_dict() 
-
+    init_state, init_version = server.get_snapshot()
     eval_model = FLNet().to(device)
-    eval_model.load_state_dict(unlearned_model_dict[fusion_types_unlearn[1]])
-    unlearn_clean_acc = Utils.evaluate(testloader, eval_model)
-    print(f'Clean Accuracy for UN-Local Model = {unlearn_clean_acc}')
-    clean_accuracy_unlearn[fusion_types_unlearn[1]] =  unlearn_clean_acc
-    pois_unlearn_acc = Utils.evaluate(testloader_poison, eval_model)
-    print(f'Backdoor Accuracy for UN-Local Model = {pois_unlearn_acc}')
-    pois_accuracy_unlearn[fusion_types_unlearn[1]] =  pois_unlearn_acc
+    eval_model.load_state_dict(init_state)
+    init_clean = Utils.evaluate(testloader, eval_model)
+    init_pois = Utils.evaluate(testloader_poison, eval_model)
+    print(f"[ASYNC-EVAL] version={init_version} | Clean={init_clean} | Backdoor={init_pois}")
+    eval_versions.append(init_version)
+    clean_history.append(init_clean)
+    poison_history.append(init_pois)
+    recorded_versions.add(init_version)
 
-num_fl_after_unlearn_rounds = num_fl_rounds
-num_updates_in_epoch = 50
-num_local_epochs = 1 
+    unlearn_triggered = False
+    reference_version = None
 
-clean_accuracy_unlearn_fl_after_unlearn = {}
-pois_accuracy_unlearn_fl_after_unlearn = {}
-loss_unlearn = {}
-for fusion_key in fusion_types_unlearn:
-    clean_accuracy_unlearn_fl_after_unlearn[fusion_key] = np.zeros(num_fl_after_unlearn_rounds)
-    pois_accuracy_unlearn_fl_after_unlearn[fusion_key] = np.zeros(num_fl_after_unlearn_rounds)
-    loss_unlearn[fusion_key] = np.zeros(num_fl_after_unlearn_rounds)
+    try:
+        while server.global_version < ASYNC_MAX_VERSION:
+            time.sleep(0.5)
+            current_version = server.global_version
 
-    
-for round_num in range(num_fl_after_unlearn_rounds):
+            if (not unlearn_triggered) and current_version >= ASYNC_UNLEARN_TRIGGER:
+                if PAUSE_DURING_UNLEARN:
+                    for client in clients:
+                        client.pause()
+                    server.wait_for_update_queue()
 
-    local_training = LocalTraining(num_updates_in_epoch=num_updates_in_epoch, num_local_epochs=num_local_epochs)
+                reference_version = server.global_version
+                server.begin_unlearning()
 
-    for fusion_key in fusion_types_unlearn:
-        # Reduce num_parties by 1 to remove the erased party
-        fusion = FL_round_fusion_selection(num_parties=num_parties - 1, fusion_key=fusion_key)
+                worker = UnlearnWorker(server=server,
+                                       target_client_id=party_to_be_erased,
+                                       trainloader=trainloader_lst[party_to_be_erased],
+                                       num_local_epochs=5,
+                                       lr=0.01,
+                                       distance_threshold=2.2,
+                                       clip_grad=5,
+                                       mode='replace',
+                                       priority_gamma=UNLEARN_PRIORITY_GAMMA,
+                                       reference_version=reference_version,
+                                       testloader=testloader,
+                                       testloader_poison=testloader_poison)
+                worker.start()
+                worker.join()
+                server.wait_for_unlearn_completion()
 
-        current_model_state_dict = copy.deepcopy(unlearned_model_dict[fusion_key])    
-        current_model = FLNet().to(device)
-        current_model.load_state_dict(current_model_state_dict)
+                if PAUSE_DURING_UNLEARN:
+                    for client in clients:
+                        client.resume()
 
-        ##################### Local Training Round #############################
-        party_models = []
-        party_losses = []
-        for party_id in range(1, num_parties):
-            model = copy.deepcopy(current_model)
-            model_update, party_loss = local_training.train(model=model, 
-                                        trainloader=trainloader_lst[party_id], 
-                                        criterion=None, opt=None)
+                print("[SERVER] Resumed async updates")
+                unlearn_triggered = True
 
-            party_models.append(copy.deepcopy(model_update))
-            party_losses.append(party_loss)
+            if current_version % ASYNC_EVAL_INTERVAL == 0 and current_version not in recorded_versions:
+                snapshot_state, snapshot_version = server.get_snapshot()
+                eval_model = FLNet().to(device)
+                eval_model.load_state_dict(snapshot_state)
+                clean_acc = Utils.evaluate(testloader, eval_model)
+                pois_acc = Utils.evaluate(testloader_poison, eval_model)
+                print(f"[ASYNC-EVAL] version={snapshot_version} | Clean={clean_acc} | Backdoor={pois_acc}")
+                eval_versions.append(snapshot_version)
+                clean_history.append(clean_acc)
+                poison_history.append(pois_acc)
+                recorded_versions.add(snapshot_version)
 
-        loss_unlearn[fusion_key][round_num] = np.mean(party_losses)
-        ######################################################################
+    finally:
+        for client in clients:
+            client.stop()
+        server.wait_for_update_queue()
+        server.stop()
 
-        current_model_state_dict = fusion.fusion_algo(party_models=party_models, current_model=current_model)
-        unlearned_model_dict[fusion_key] = copy.deepcopy(current_model_state_dict)
-        party_models_dict[fusion_key] = party_models  
-
-        eval_model = FLNet().to(device)
-        eval_model.load_state_dict(current_model_state_dict)
-        unlearn_clean_acc = Utils.evaluate(testloader, eval_model)
-        print(f'Global Clean Accuracy {fusion_key}, round {round_num} = {unlearn_clean_acc}')
-        clean_accuracy_unlearn_fl_after_unlearn[fusion_key][round_num] = unlearn_clean_acc
-        unlearn_pois_acc = Utils.evaluate(testloader_poison, eval_model)
-        print(f'Global Backdoor Accuracy {fusion_key}, round {round_num} = {unlearn_pois_acc}')
-        pois_accuracy_unlearn_fl_after_unlearn[fusion_key][round_num] = unlearn_pois_acc
-
-
-import matplotlib.pyplot as plt
-
-fl_rounds = [i for i in range(1, num_fl_rounds + 1)]
-
-plt.plot(fl_rounds, clean_accuracy_unlearn_fl_after_unlearn['Unlearn'], 'ro--', linewidth=2, markersize=12, label='UN-Clean Acc')
-plt.plot(fl_rounds, pois_accuracy_unlearn_fl_after_unlearn['Unlearn'], 'gx--', linewidth=2, markersize=12, label='UN-Backdoor Acc') 
-plt.plot(fl_rounds, clean_accuracy_unlearn_fl_after_unlearn['Retrain'], 'm^-', linewidth=2, markersize=12, label='Retrain-Clean Acc')
-plt.plot(fl_rounds, pois_accuracy_unlearn_fl_after_unlearn['Retrain'], 'c+-', linewidth=2, markersize=12, label='Retrain-Backdoor Acc')
-plt.xlabel('Training Rounds')
-plt.ylabel('Accuracy')
-plt.grid()
-plt.ylim([0, 100])
-plt.xlim([1, 10])
-plt.legend()
-plt.show()
+    plt.figure()
+    plt.plot(eval_versions, clean_history, 'r-', linewidth=2, marker='o', label='Clean Accuracy')
+    plt.plot(eval_versions, poison_history, 'b-', linewidth=2, marker='x', label='Backdoor Accuracy')
+    if unlearn_triggered and reference_version is not None:
+        plt.axvline(x=reference_version + 1, linestyle='--', color='k', label='Unlearn Event')
+    plt.xlabel('Global Version')
+    plt.ylabel('Accuracy')
+    plt.grid()
+    plt.legend()
+    plt.show()
