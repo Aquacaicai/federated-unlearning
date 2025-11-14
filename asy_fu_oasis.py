@@ -105,6 +105,7 @@ BATCH_SIZE = 16  # MRI slices are heavier; 8 or 4 if memory limited
 DATA_ROOT = Path(__file__).resolve().parent / "imagesoasis"
 NUM_WORKERS = 8
 PREFETCH_FACTOR = 2
+MAJORITY_DOWNSAMPLE_RATIO = 0.2
 
 # Directories for logging/plots
 DOC_DIR = Path(__file__).resolve().parent / "doc"
@@ -195,6 +196,37 @@ def collect_indices(patient_ids, mapping):
     return list(itertools.chain.from_iterable(mapping[pid] for pid in patient_ids))
 
 
+def downsample_indices_for_client(indices, targets, sample_ratio=MAJORITY_DOWNSAMPLE_RATIO):
+    """Down-sample majority classes within a client's index list."""
+
+    if not indices:
+        return [], {}
+
+    label_to_indices: Dict[int, List[int]] = {}
+    for idx in indices:
+        label = targets[idx]
+        label_to_indices.setdefault(label, []).append(idx)
+
+    class_counts = {label: len(idxs) for label, idxs in label_to_indices.items()}
+    median_count = float(np.median(list(class_counts.values()))) if class_counts else 0.0
+
+    new_indices = []
+    new_class_counts: Dict[int, int] = {}
+    for label, idxs in label_to_indices.items():
+        count = len(idxs)
+        if count > median_count and sample_ratio < 1.0:
+            keep = max(1, int(math.ceil(count * sample_ratio)))
+            keep = min(keep, count)
+            selected = random.sample(idxs, keep)
+        else:
+            selected = idxs
+        new_indices.extend(selected)
+        new_class_counts[label] = len(selected)
+
+    new_indices.sort()
+    return new_indices, new_class_counts
+
+
 def compute_asr(model, loader, target_label):
     model.eval()
     tot, hit = 0, 0
@@ -260,12 +292,32 @@ def prepare_oasis_dataloaders():
     poison_indices = set(rng.choice(erased_candidates, size=num_poison, replace=False).tolist()) if num_poison > 0 else set()
 
     party_datasets = []
+    global_downsampled_counts = [0 for _ in range(num_classes)]
     for party_id, indices in enumerate(party_indices_list):
+        sampled_indices, sampled_counts = downsample_indices_for_client(
+            indices,
+            full_dataset.targets,
+            sample_ratio=MAJORITY_DOWNSAMPLE_RATIO,
+        )
+
+        if not sampled_indices and indices:
+            sampled_indices = list(indices)
+            sampled_counts = {}
+            for idx in sampled_indices:
+                label = full_dataset.targets[idx]
+                sampled_counts[label] = sampled_counts.get(label, 0) + 1
+
+        print(f"[DATA] Client {party_id} downsampled class counts: {sampled_counts}")
+        for cls in range(num_classes):
+            global_downsampled_counts[cls] += sampled_counts.get(cls, 0)
+
         if party_id == PARTY_TO_BE_ERASED:
-            ds = PoisonedIndexedDataset(full_dataset, indices, poison_indices, target_label)
+            ds = PoisonedIndexedDataset(full_dataset, sampled_indices, poison_indices, target_label)
         else:
-            ds = IndexedDataset(full_dataset, indices)
+            ds = IndexedDataset(full_dataset, sampled_indices)
         party_datasets.append(ds)
+
+    print(f"[DATA] Global downsampled train class counts: {global_downsampled_counts}")
 
     trainloader_lst = [
         DataLoader(
@@ -315,7 +367,7 @@ def prepare_oasis_dataloaders():
         prefetch_factor=PREFETCH_FACTOR,
     )
 
-    counts_tensor = torch.tensor(counts, dtype=torch.float32)
+    counts_tensor = torch.tensor(global_downsampled_counts, dtype=torch.float32)
     counts_tensor = torch.clamp(counts_tensor, min=1.0)
     max_count = counts_tensor.max()
     # Mild inverse-frequency re-weighting (sqrt) avoids the previous oscillations
@@ -333,6 +385,7 @@ def prepare_oasis_dataloaders():
         "target_label": target_label,
         "target_class_name": target_class_name,
         "counts": counts,
+        "downsampled_counts": global_downsampled_counts,
     }
 
 
