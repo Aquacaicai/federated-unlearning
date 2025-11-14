@@ -15,11 +15,58 @@ from torch.utils.data import DataLoader, Dataset
 from torchvision import datasets, transforms
 
 import matplotlib.pyplot as plt
+from collections import defaultdict
+from statistics import median
 
 from utils.model import FLNet, MRICNN
 from utils.local_train import LocalTraining
 from utils.utils import Utils
 from utils.fusion import Fusion, FusionAvg, FusionRetrain
+
+
+def downsample_dataset(dataset, sample_ratio=0.2):
+    """Downsample majority classes to alleviate class imbalance."""
+    labels = []
+    if hasattr(dataset, 'targets'):
+        labels = list(dataset.targets)
+    elif hasattr(dataset, 'labels'):
+        labels = list(dataset.labels)
+    else:
+        for i in range(len(dataset)):
+            sample = dataset[i]
+            if isinstance(sample, tuple) and len(sample) >= 2:
+                label = sample[1]
+            else:
+                raise ValueError('Dataset samples must be (data, label) tuples for downsampling.')
+            if isinstance(label, torch.Tensor):
+                label = label.item()
+            labels.append(int(label))
+
+    class_indices = defaultdict(list)
+    for idx, lbl in enumerate(labels):
+        class_indices[lbl].append(idx)
+
+    if not class_indices:
+        return dataset, {}
+
+    median_count = int(median(len(idxs) for idxs in class_indices.values()))
+    downsampled_indices = []
+    new_class_counts = {}
+
+    for cls, idxs in class_indices.items():
+        count = len(idxs)
+        if median_count > 0 and count > median_count:
+            new_count = max(1, int(count * sample_ratio))
+            sampled_idx = random.sample(idxs, new_count)
+            downsampled_indices.extend(sampled_idx)
+            new_class_counts[cls] = new_count
+        else:
+            downsampled_indices.extend(idxs)
+            new_class_counts[cls] = count
+
+    downsampled_indices.sort()
+    downsampled_dataset = torch.utils.data.Subset(dataset, downsampled_indices)
+    return downsampled_dataset, new_class_counts
 
 # -----------------------------------------------------------------------------
 # Run-mode switch so that the async OASIS pipeline can be triggered without
@@ -231,11 +278,24 @@ for party_id, indices in enumerate(party_indices_list):
     party_datasets.append(ds)
 
 # DataLoaders
-trainloader_lst = [
-    DataLoader(ds, batch_size=batch_size, shuffle=True,
-               num_workers=8, pin_memory=True, persistent_workers=True, prefetch_factor=2)
-    for ds in party_datasets
-]
+trainloader_lst = []
+total_class_counts = defaultdict(int)
+for party_id, ds in enumerate(party_datasets):
+    downsampled_ds, new_counts = downsample_dataset(ds, sample_ratio=0.2)
+    for cls, cnt in new_counts.items():
+        total_class_counts[cls] += cnt
+    print(f'Client {party_id} downsampled class distribution: {new_counts}')
+    trainloader_lst.append(
+        DataLoader(
+            downsampled_ds,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=8,
+            pin_memory=True,
+            persistent_workers=True,
+            prefetch_factor=2,
+        )
+    )
 
 test_patient_indices = collect_indices(test_patient_ids, patient_to_indices)
 test_dataset = IndexedDataset(full_dataset, test_patient_indices)
@@ -261,11 +321,15 @@ print(f'Total patients: {len(patient_ids)} | train: {len(train_patient_ids)} | t
 for idx, group in enumerate(train_patient_groups):
     print(f'Party {idx}: {len(group)} patients, {len(party_indices_list[idx])} slices')
 print(f'Poison samples selected for party {party_to_be_erased}: {len(poison_indices)} -> target "{target_class_name}"')
+print(f'Global class distribution after downsampling: {dict(total_class_counts)}')
 
 # === 改2：全局类别权重（缓解极不平衡） ===
-class_weights = torch.tensor(1.0 / (counts + 1e-6), dtype=torch.float32)
-class_weights = class_weights / class_weights.sum() * num_classes  # 归一化到平均权重=1
-class_weights = class_weights.to(device)
+class_weights_list = []
+for cls in range(num_classes):
+    count = total_class_counts.get(cls, 0)
+    effective_count = count if count > 0 else 1e-6
+    class_weights_list.append(1.0 / math.sqrt(effective_count))
+class_weights = torch.tensor(class_weights_list, dtype=torch.float32, device=device)
 
 def create_model():
     """Factory for the federated model."""
