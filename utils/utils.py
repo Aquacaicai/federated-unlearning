@@ -68,6 +68,15 @@ class Utils():
                 logging.warning(
                     f"[WARN] Single-class collapse detected: class={dominant_idx} ratio={dominant_ratio:.4f}"
                 )
+            else:
+                topk = np.argsort(pred_hist)[::-1][: min(3, num_classes)]
+                summary = ", ".join(
+                    [
+                        f"{idx}: {pred_hist[idx]/max(1,total):.2%}"
+                        for idx in topk
+                    ]
+                )
+                logging.info(f"[HIST] Pred distribution snapshot -> {summary}")
         return acc
 
 
