@@ -61,6 +61,13 @@ class Utils():
         logging.info(
             f"[DEBUG] Acc={acc:.2f} True={true_hist.tolist()} Pred={pred_hist.tolist()}"
         )
+        if total > 0:
+            dominant_idx = int(np.argmax(pred_hist))
+            dominant_ratio = pred_hist[dominant_idx] / total
+            if dominant_ratio >= 0.95:
+                logging.warning(
+                    f"[WARN] Single-class collapse detected: class={dominant_idx} ratio={dominant_ratio:.4f}"
+                )
         return acc
 
 
