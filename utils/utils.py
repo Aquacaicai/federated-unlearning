@@ -1,3 +1,4 @@
+import logging
 import numpy as np
 import torch
 from torch import nn
@@ -37,6 +38,30 @@ class Utils():
                 correct += (predicted == labels).sum().item()
 
         return 100 * correct / total
+
+    @staticmethod
+    def eval_with_class_hist(loader, model, num_classes, device):
+        model.eval()
+        total = 0
+        correct = 0
+        pred_hist = np.zeros(num_classes, dtype=int)
+        true_hist = np.zeros(num_classes, dtype=int)
+        with torch.no_grad():
+            for x, y in loader:
+                x = x.to(device)
+                y = y.to(device)
+                outputs = model(x)
+                preds = outputs.argmax(dim=1)
+                correct += (preds == y).sum().item()
+                total += y.numel()
+                for c in range(num_classes):
+                    pred_hist[c] += (preds == c).sum().item()
+                    true_hist[c] += (y == c).sum().item()
+        acc = 100.0 * correct / max(1, total)
+        logging.info(
+            f"[DEBUG] Acc={acc:.2f} True={true_hist.tolist()} Pred={pred_hist.tolist()}"
+        )
+        return acc
 
 
 
