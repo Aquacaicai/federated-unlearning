@@ -2,7 +2,9 @@ import copy
 import csv
 import itertools
 import math
+import os
 import random
+import sys
 from datetime import datetime
 from pathlib import Path
 
@@ -18,6 +20,20 @@ from utils.model import FLNet, MRICNN
 from utils.local_train import LocalTraining
 from utils.utils import Utils
 from utils.fusion import Fusion, FusionAvg, FusionRetrain
+
+# -----------------------------------------------------------------------------
+# Run-mode switch so that the async OASIS pipeline can be triggered without
+# touching the legacy synchronous workflow.
+# -----------------------------------------------------------------------------
+RUN_MODE = os.environ.get('OASIS_RUN_MODE', 'sync').lower()
+if RUN_MODE == 'async':
+    from oasis_async_unlearning import run_async_oasis
+
+    if __name__ == '__main__':
+        run_async_oasis()
+    else:
+        run_async_oasis()
+    sys.exit(0)
 
 # -------------------------
 # Repro & cuDNN / TF32
