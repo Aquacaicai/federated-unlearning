@@ -61,6 +61,8 @@ device = torch.device("cuda")
 # Global configuration for async experimentation (MRI-friendly defaults)
 # -----------------------------------------------------------------------------
 RUN_MODE = "async"
+DEBUG_SINGLE_CLIENT = False
+DEBUG_SINGLE_CLIENT_EPOCHS = 6
 PAUSE_DURING_UNLEARN = True
 STALENESS_LAMBDA = 0.2  # 0.1~0.3 recommended: smaller => tolerate staler updates
 SIM_MIN_SLEEP = 0.05
@@ -77,6 +79,10 @@ POST_UNLEARN_LR = 7e-4
 POST_UNLEARN_MAX_UPDATES = None
 ASYNC_STOP_AFTER_UNLEARN_ROUNDS = 60
 MIXED_PRECISION = False  # disable if you hit AMP overflow/underflow instabilities
+MAX_LOCAL_UPDATES_PER_EPOCH = 200
+CLIENT_GRAD_CLIP_NORM = 5.0
+SERVER_LR = 0.1  # Tune 0.05~0.2 depending on update magnitude
+SERVER_MAX_DELTA_NORM = 1.0  # Set <=0 to disable clipping
 
 # Unlearning hyper-parameters (MRI tuned)
 # Tips:
@@ -336,11 +342,29 @@ def subtract_state_dict(state_a, state_b):
     return {k: state_a[k] - state_b[k] for k in state_a}
 
 
+def clip_delta_state_dict(delta_state, max_norm):
+    if max_norm is None or max_norm <= 0:
+        return 1.0
+    total_norm_sq = 0.0
+    for tensor in delta_state.values():
+        if tensor.dtype.is_floating_point:
+            total_norm_sq += float(tensor.float().pow(2).sum().item())
+    total_norm = math.sqrt(total_norm_sq)
+    if total_norm == 0 or total_norm <= max_norm:
+        return 1.0
+    scale = max_norm / (total_norm + 1e-12)
+    for name, tensor in delta_state.items():
+        if tensor.dtype.is_floating_point:
+            delta_state[name] = tensor * scale
+    return scale
+
+
 class FusionAsync:
-    def apply_update(self, model, delta_state, weight):
+    def apply_update(self, model, delta_state, weight, server_lr=SERVER_LR):
         with torch.no_grad():
             for name, param in model.state_dict().items():
-                param.add_(weight * delta_state[name].to(param.device))
+                if param.dtype.is_floating_point:
+                    param.add_(server_lr * weight * delta_state[name].to(param.device))
 
 
 class AsyncServer:
@@ -492,7 +516,12 @@ class AsyncServer:
         with self.lock:
             staleness = max(0, self.global_version - version_seen)
             weight = math.exp(-self.staleness_lambda * staleness)
-            self.fusion.apply_update(self.global_model, delta_state, weight)
+            clip_scale = clip_delta_state_dict(delta_state, SERVER_MAX_DELTA_NORM)
+            if clip_scale < 1.0:
+                logging.debug(
+                    f"[SERVER] Delta clipped for client {client_id}: scale={clip_scale:.3f}"
+                )
+            self.fusion.apply_update(self.global_model, delta_state, weight, server_lr=SERVER_LR)
             self.global_version += 1
             self.total_updates += 1
             self.client_status[client_id] = {
@@ -609,19 +638,36 @@ class ClientSimulator:
                 local_epochs = self.num_local_epochs
                 updates_cap = self.num_updates_in_epoch
 
-            optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+            optimizer = torch.optim.SGD(
+                model.parameters(), lr=lr, momentum=0.9, weight_decay=1e-4
+            )
             criterion = nn.CrossEntropyLoss()
 
             updates_done = 0
-            for _ in range(local_epochs):
+            effective_epochs = max(1, local_epochs)
+            if updates_cap is None:
+                epoch_cap = min(len(self.trainloader), MAX_LOCAL_UPDATES_PER_EPOCH)
+                max_updates_total = epoch_cap * effective_epochs
+            else:
+                epoch_cap = len(self.trainloader)
+                max_updates_total = min(updates_cap, len(self.trainloader) * effective_epochs)
+            max_updates_total = max(1, max_updates_total)
+
+            for _ in range(effective_epochs):
                 if iterator is None:
                     iterator = iter(self.trainloader)
-                for _ in range(len(self.trainloader)):
+                if updates_done >= max_updates_total:
+                    break
+                steps_allowed = epoch_cap if updates_cap is None else min(
+                    epoch_cap, max_updates_total - updates_done
+                )
+                steps_taken = 0
+                while steps_taken < steps_allowed and updates_done < max_updates_total:
                     try:
                         x_batch, y_batch = next(iterator)
                     except StopIteration:
                         iterator = iter(self.trainloader)
-                        x_batch, y_batch = next(iterator)
+                        continue
                     x_batch = x_batch.to(device, non_blocking=True)
                     y_batch = y_batch.to(device, non_blocking=True)
 
@@ -630,14 +676,13 @@ class ClientSimulator:
                         outputs = model(x_batch)
                         loss = criterion(outputs, y_batch)
                     self.scaler.scale(loss).backward()
+                    self.scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), CLIENT_GRAD_CLIP_NORM)
                     self.scaler.step(optimizer)
                     self.scaler.update()
 
                     updates_done += 1
-                    if updates_cap is not None and updates_done >= updates_cap:
-                        break
-                if updates_cap is not None and updates_done >= updates_cap:
-                    break
+                    steps_taken += 1
 
             final_state = clone_state_dict(model.state_dict())
             delta = subtract_state_dict(final_state, base_state)
@@ -765,6 +810,43 @@ class UnlearnWorker(threading.Thread):
 
 
 # -----------------------------------------------------------------------------
+# Driver helpers
+# -----------------------------------------------------------------------------
+def run_single_client_debug(trainloader, testloader, num_classes):
+    model = create_model(num_classes)
+    criterion = nn.CrossEntropyLoss()
+    optimizer = torch.optim.SGD(
+        model.parameters(), lr=BASE_CLIENT_LR, momentum=0.9, weight_decay=1e-4
+    )
+    scaler = amp.GradScaler(enabled=MIXED_PRECISION)
+
+    for epoch in range(1, DEBUG_SINGLE_CLIENT_EPOCHS + 1):
+        model.train()
+        running_loss = 0.0
+        steps = 0
+        for x_batch, y_batch in trainloader:
+            x_batch = x_batch.to(device, non_blocking=True)
+            y_batch = y_batch.to(device, non_blocking=True)
+            optimizer.zero_grad(set_to_none=True)
+            with amp.autocast(enabled=MIXED_PRECISION):
+                outputs = model(x_batch)
+                loss = criterion(outputs, y_batch)
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), CLIENT_GRAD_CLIP_NORM)
+            scaler.step(optimizer)
+            scaler.update()
+            running_loss += loss.item()
+            steps += 1
+        avg_loss = running_loss / max(1, steps)
+        clean_acc = Utils.eval_with_class_hist(testloader, model, num_classes, device)
+        logging.info(
+            f"[DEBUG-SINGLE-CLIENT] epoch={epoch} loss={avg_loss:.4f} clean_acc={clean_acc:.2f}"
+        )
+    logging.info("[DEBUG-SINGLE-CLIENT] training complete")
+
+
+# -----------------------------------------------------------------------------
 # Driver
 # -----------------------------------------------------------------------------
 def run_async_oasis():
@@ -790,6 +872,15 @@ def run_async_oasis():
     logging.info(
         f"Target class '{target_class_name}' (label={target_label}) will be poisoned at party {PARTY_TO_BE_ERASED} with {PERCENT_POISON*100:.1f}% ratio"
     )
+
+    if DEBUG_SINGLE_CLIENT:
+        logging.info("DEBUG_SINGLE_CLIENT is enabled; running standalone training loop")
+        run_single_client_debug(
+            trainloader_lst[0],
+            testloader,
+            num_classes,
+        )
+        return
 
     async_initial_model = create_model(num_classes)
     server = AsyncServer(
