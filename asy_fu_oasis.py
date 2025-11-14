@@ -196,8 +196,16 @@ def collect_indices(patient_ids, mapping):
     return list(itertools.chain.from_iterable(mapping[pid] for pid in patient_ids))
 
 
-def downsample_indices_for_client(indices, targets, sample_ratio=MAJORITY_DOWNSAMPLE_RATIO):
-    """Down-sample majority classes within a client's index list."""
+def balance_indices_for_client(indices, targets):
+    """Balance per-client class counts following the Kaggle notebook recipe.
+
+    The Kaggle reference script first collected the global class counts and then
+    sampled each class down to the minimum count so that training operates on a
+    perfectly balanced dataset.  We apply the same idea per client (rather than
+    globally) so that each federated participant trains on a locally balanced
+    subset.  This strongly reduces the majority-class dominance that previously
+    led to the 74.40% "all-class-2" collapse.
+    """
 
     if not indices:
         return [], {}
@@ -207,24 +215,25 @@ def downsample_indices_for_client(indices, targets, sample_ratio=MAJORITY_DOWNSA
         label = targets[idx]
         label_to_indices.setdefault(label, []).append(idx)
 
-    class_counts = {label: len(idxs) for label, idxs in label_to_indices.items()}
-    median_count = float(np.median(list(class_counts.values()))) if class_counts else 0.0
+    # Only consider labels that actually appear for this client; otherwise a
+    # zero count would force "min" to 0 and wipe out the entire dataset.
+    non_zero_counts = [len(idxs) for idxs in label_to_indices.values() if len(idxs) > 0]
+    if not non_zero_counts:
+        return [], {}
+    min_count = min(non_zero_counts)
 
-    new_indices = []
-    new_class_counts: Dict[int, int] = {}
+    balanced_indices = []
+    balanced_counts: Dict[int, int] = {}
     for label, idxs in label_to_indices.items():
-        count = len(idxs)
-        if count > median_count and sample_ratio < 1.0:
-            keep = max(1, int(math.ceil(count * sample_ratio)))
-            keep = min(keep, count)
-            selected = random.sample(idxs, keep)
+        if len(idxs) > min_count:
+            selected = random.sample(idxs, min_count)
         else:
-            selected = idxs
-        new_indices.extend(selected)
-        new_class_counts[label] = len(selected)
+            selected = list(idxs)
+        balanced_indices.extend(selected)
+        balanced_counts[label] = len(selected)
 
-    new_indices.sort()
-    return new_indices, new_class_counts
+    balanced_indices.sort()
+    return balanced_indices, balanced_counts
 
 
 def compute_asr(model, loader, target_label):
@@ -292,12 +301,16 @@ def prepare_oasis_dataloaders():
     poison_indices = set(rng.choice(erased_candidates, size=num_poison, replace=False).tolist()) if num_poison > 0 else set()
 
     party_datasets = []
-    global_downsampled_counts = [0 for _ in range(num_classes)]
+    global_balanced_counts = [0 for _ in range(num_classes)]
+    global_raw_counts = [0 for _ in range(num_classes)]
+    for indices in party_indices_list:
+        for idx in indices:
+            label = full_dataset.targets[idx]
+            global_raw_counts[label] += 1
     for party_id, indices in enumerate(party_indices_list):
-        sampled_indices, sampled_counts = downsample_indices_for_client(
+        sampled_indices, sampled_counts = balance_indices_for_client(
             indices,
             full_dataset.targets,
-            sample_ratio=MAJORITY_DOWNSAMPLE_RATIO,
         )
 
         if not sampled_indices and indices:
@@ -307,9 +320,9 @@ def prepare_oasis_dataloaders():
                 label = full_dataset.targets[idx]
                 sampled_counts[label] = sampled_counts.get(label, 0) + 1
 
-        print(f"[DATA] Client {party_id} downsampled class counts: {sampled_counts}")
+        print(f"[DATA] Client {party_id} balanced class counts: {sampled_counts}")
         for cls in range(num_classes):
-            global_downsampled_counts[cls] += sampled_counts.get(cls, 0)
+            global_balanced_counts[cls] += sampled_counts.get(cls, 0)
 
         if party_id == PARTY_TO_BE_ERASED:
             ds = PoisonedIndexedDataset(full_dataset, sampled_indices, poison_indices, target_label)
@@ -317,7 +330,8 @@ def prepare_oasis_dataloaders():
             ds = IndexedDataset(full_dataset, sampled_indices)
         party_datasets.append(ds)
 
-    print(f"[DATA] Global downsampled train class counts: {global_downsampled_counts}")
+    print(f"[DATA] Original global train class counts: {global_raw_counts}")
+    print(f"[DATA] Global balanced train class counts: {global_balanced_counts}")
 
     trainloader_lst = [
         DataLoader(
@@ -334,6 +348,12 @@ def prepare_oasis_dataloaders():
 
     test_patient_indices = collect_indices(test_patient_ids, patient_to_indices)
     test_dataset = IndexedDataset(full_dataset, test_patient_indices)
+
+    test_class_counts = [0 for _ in range(num_classes)]
+    for idx in test_patient_indices:
+        label = full_dataset.targets[idx]
+        test_class_counts[label] += 1
+    print(f"[DATA] Test class counts: {test_class_counts}")
 
     test_non_target_indices = [idx for idx in test_patient_indices if full_dataset.targets[idx] != target_label]
     test_dataset_poison = PoisonedIndexedDataset(full_dataset, test_patient_indices, test_non_target_indices, target_label)
@@ -367,13 +387,29 @@ def prepare_oasis_dataloaders():
         prefetch_factor=PREFETCH_FACTOR,
     )
 
-    counts_tensor = torch.tensor(global_downsampled_counts, dtype=torch.float32)
-    counts_tensor = torch.clamp(counts_tensor, min=1.0)
-    max_count = counts_tensor.max()
-    # Mild inverse-frequency re-weighting (sqrt) avoids the previous oscillations
-    raw_weights = (max_count / counts_tensor).pow(0.5)
-    class_weights = raw_weights / raw_weights.mean()
-    class_weights = class_weights.to(device)
+    counts_tensor = torch.tensor(global_balanced_counts, dtype=torch.float32)
+    positive_mask = counts_tensor > 0
+    if positive_mask.sum() == 0:
+        class_weights = None
+        logging.info("[DATA] No positive class counts detected; disabling class weights.")
+    else:
+        positive_counts = counts_tensor[positive_mask]
+        imbalance_ratio = positive_counts.max().item() / max(1.0, positive_counts.min().item())
+        if imbalance_ratio <= 1.2:
+            class_weights = None
+            logging.info(
+                "[DATA] Balanced split nearly uniform; class weights disabled to avoid over-biasing."
+            )
+        else:
+            effective_counts = counts_tensor.clone()
+            max_count = positive_counts.max()
+            effective_counts[~positive_mask] = max_count
+            raw_weights = (max_count / effective_counts.clamp(min=1.0)).pow(0.35)
+            class_weights = raw_weights / raw_weights.mean()
+            class_weights = class_weights.to(device)
+            logging.info(
+                f"[DATA] Class weights (normalized): {class_weights.detach().cpu().numpy().round(3).tolist()}"
+            )
 
     return {
         "trainloaders": trainloader_lst,
@@ -385,7 +421,9 @@ def prepare_oasis_dataloaders():
         "target_label": target_label,
         "target_class_name": target_class_name,
         "counts": counts,
-        "downsampled_counts": global_downsampled_counts,
+        "balanced_counts": global_balanced_counts,
+        "raw_train_counts": global_raw_counts,
+        "test_counts": test_class_counts,
     }
 
 
