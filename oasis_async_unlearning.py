@@ -66,17 +66,17 @@ STALENESS_LAMBDA = 0.2  # 0.1~0.3 recommended: smaller => tolerate staler update
 SIM_MIN_SLEEP = 0.05
 SIM_MAX_SLEEP = 0.25
 ASYNC_SNAPSHOT_KEEP = 30
-ASYNC_EVAL_INTERVAL = 3
+ASYNC_EVAL_INTERVAL = 2
 ASYNC_MAX_VERSION = 140
 ASYNC_UNLEARN_TRIGGER = 60
 # BASE_CLIENT_LR keeps MRI training stable; go smaller (5e-4) if OOM or unstable.
-BASE_CLIENT_LR = 1e-3
+BASE_CLIENT_LR = 3e-4
 # Post-unlearning LR should still be assertive—avoid dropping below ~3e-4 or
 # post-FL recovery will stall. Increase if clean accuracy recovers too slowly.
 POST_UNLEARN_LR = 7e-4
 POST_UNLEARN_MAX_UPDATES = None
 ASYNC_STOP_AFTER_UNLEARN_ROUNDS = 60
-MIXED_PRECISION = True  # disable if you hit AMP overflow/underflow instabilities
+MIXED_PRECISION = False  # disable if you hit AMP overflow/underflow instabilities
 
 # Unlearning hyper-parameters (MRI tuned)
 # Tips:
@@ -307,16 +307,12 @@ def prepare_oasis_dataloaders():
         prefetch_factor=PREFETCH_FACTOR,
     )
 
-    class_weights = torch.tensor(1.0 / (counts + 1e-6), dtype=torch.float32)
-    class_weights = class_weights / class_weights.sum() * len(class_weights)
-    class_weights = class_weights.to(device)
-
     return {
         "trainloaders": trainloader_lst,
         "testloader": testloader,
         "testloader_poison": testloader_poison,
         "testloader_bd_asr": testloader_bd_asr,
-        "class_weights": class_weights,
+        "class_weights": None,
         "num_classes": len(class_names),
         "target_label": target_label,
         "target_class_name": target_class_name,
@@ -614,7 +610,7 @@ class ClientSimulator:
                 updates_cap = self.num_updates_in_epoch
 
             optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-            criterion = nn.CrossEntropyLoss(weight=self.class_weights)
+            criterion = nn.CrossEntropyLoss()
 
             updates_done = 0
             for _ in range(local_epochs):
@@ -707,7 +703,7 @@ class UnlearnWorker(threading.Thread):
         model.load_state_dict(copy.deepcopy(model_ref_state))
         model.train()
 
-        criterion = nn.CrossEntropyLoss(weight=self.class_weights)
+        criterion = nn.CrossEntropyLoss()
         optimizer = torch.optim.Adam(model.parameters(), lr=self.lr)
 
         threshold = self.projection_radius ** 2
@@ -757,7 +753,9 @@ class UnlearnWorker(threading.Thread):
         eval_model = create_model(self.num_classes)
         eval_model.load_state_dict(unlearned_model_state)
         if self.testloader is not None:
-            clean = Utils.evaluate(self.testloader, eval_model)
+            clean = Utils.eval_with_class_hist(
+                self.testloader, eval_model, self.num_classes, device
+            )
             pois = Utils.evaluate(self.testloader_poison, eval_model)
             log_msg = f"[UNLEARN] immediate eval: Clean={clean:.2f} Backdoor={pois:.2f}"
             if self.testloader_bd is not None and self.target_label is not None:
@@ -837,7 +835,7 @@ def run_async_oasis():
     init_state, init_version = server.get_snapshot()
     eval_model = create_model(num_classes)
     eval_model.load_state_dict(init_state)
-    init_clean = Utils.evaluate(testloader, eval_model)
+    init_clean = Utils.eval_with_class_hist(testloader, eval_model, num_classes, device)
     init_pois = Utils.evaluate(testloader_poison, eval_model)
     init_asr = compute_asr(eval_model, testloader_bd, target_label)
     logging.info(
@@ -893,7 +891,7 @@ def run_async_oasis():
                 snapshot_state, snapshot_version = server.get_snapshot()
                 eval_model = create_model(num_classes)
                 eval_model.load_state_dict(snapshot_state)
-                post_clean = Utils.evaluate(testloader, eval_model)
+                post_clean = Utils.eval_with_class_hist(testloader, eval_model, num_classes, device)
                 post_pois = Utils.evaluate(testloader_poison, eval_model)
                 post_asr = compute_asr(eval_model, testloader_bd, target_label)
                 logging.info(
@@ -941,7 +939,7 @@ def run_async_oasis():
                 snapshot_state, snapshot_version = server.get_snapshot()
                 eval_model = create_model(num_classes)
                 eval_model.load_state_dict(snapshot_state)
-                clean_acc = Utils.evaluate(testloader, eval_model)
+                clean_acc = Utils.eval_with_class_hist(testloader, eval_model, num_classes, device)
                 pois_acc = Utils.evaluate(testloader_poison, eval_model)
                 asr = compute_asr(eval_model, testloader_bd, target_label)
                 logging.info(
