@@ -63,6 +63,7 @@ device = torch.device("cuda")
 RUN_MODE = "async"
 DEBUG_SINGLE_CLIENT = False
 DEBUG_SINGLE_CLIENT_EPOCHS = 6
+DEBUG_SINGLE_CLIENT_LR = 1.2e-3  # make single-client sanity checks assertive
 PAUSE_DURING_UNLEARN = True
 STALENESS_LAMBDA = 0.2  # 0.1~0.3 recommended: smaller => tolerate staler updates
 SIM_MIN_SLEEP = 0.05
@@ -71,8 +72,9 @@ ASYNC_SNAPSHOT_KEEP = 30
 ASYNC_EVAL_INTERVAL = 2
 ASYNC_MAX_VERSION = 140
 ASYNC_UNLEARN_TRIGGER = 60
-# BASE_CLIENT_LR keeps MRI training stable; go smaller (5e-4) if OOM or unstable.
-BASE_CLIENT_LR = 3e-4
+# BASE_CLIENT_LR keeps MRI training stable; boost to 1e-3 so local steps escape
+# trivial majority-class optima. Drop to 5e-4 only if training diverges.
+BASE_CLIENT_LR = 1e-3
 # Post-unlearning LR should still be assertive—avoid dropping below ~3e-4 or
 # post-FL recovery will stall. Increase if clean accuracy recovers too slowly.
 POST_UNLEARN_LR = 7e-4
@@ -313,12 +315,20 @@ def prepare_oasis_dataloaders():
         prefetch_factor=PREFETCH_FACTOR,
     )
 
+    counts_tensor = torch.tensor(counts, dtype=torch.float32)
+    counts_tensor = torch.clamp(counts_tensor, min=1.0)
+    max_count = counts_tensor.max()
+    # Mild inverse-frequency re-weighting (sqrt) avoids the previous oscillations
+    raw_weights = (max_count / counts_tensor).pow(0.5)
+    class_weights = raw_weights / raw_weights.mean()
+    class_weights = class_weights.to(device)
+
     return {
         "trainloaders": trainloader_lst,
         "testloader": testloader,
         "testloader_poison": testloader_poison,
         "testloader_bd_asr": testloader_bd_asr,
-        "class_weights": None,
+        "class_weights": class_weights,
         "num_classes": len(class_names),
         "target_label": target_label,
         "target_class_name": target_class_name,
@@ -574,7 +584,9 @@ class ClientSimulator:
         self.trainloader = trainloader
         self.server = server
         self.num_classes = num_classes
-        self.class_weights = class_weights
+        self.class_weights = (
+            class_weights.clone().detach().to(device) if class_weights is not None else None
+        )
         self.compute_speed = compute_speed
         self.local_version = 0
         self.active_event = threading.Event()
@@ -641,7 +653,7 @@ class ClientSimulator:
             optimizer = torch.optim.SGD(
                 model.parameters(), lr=lr, momentum=0.9, weight_decay=1e-4
             )
-            criterion = nn.CrossEntropyLoss()
+            criterion = nn.CrossEntropyLoss(weight=self.class_weights)
 
             updates_done = 0
             effective_epochs = max(1, local_epochs)
@@ -723,7 +735,9 @@ class UnlearnWorker(threading.Thread):
         self.target_client_id = target_client_id
         self.trainloader = trainloader
         self.num_classes = num_classes
-        self.class_weights = class_weights
+        self.class_weights = (
+            class_weights.clone().detach().to(device) if class_weights is not None else None
+        )
         self.num_local_epochs = num_local_epochs
         self.lr = lr
         self.clip_grad = clip_grad
@@ -748,7 +762,7 @@ class UnlearnWorker(threading.Thread):
         model.load_state_dict(copy.deepcopy(model_ref_state))
         model.train()
 
-        criterion = nn.CrossEntropyLoss()
+        criterion = nn.CrossEntropyLoss(weight=self.class_weights)
         optimizer = torch.optim.Adam(model.parameters(), lr=self.lr)
 
         threshold = self.projection_radius ** 2
@@ -812,11 +826,15 @@ class UnlearnWorker(threading.Thread):
 # -----------------------------------------------------------------------------
 # Driver helpers
 # -----------------------------------------------------------------------------
-def run_single_client_debug(trainloader, testloader, num_classes):
+def run_single_client_debug(trainloader, testloader, num_classes, class_weights=None):
     model = create_model(num_classes)
-    criterion = nn.CrossEntropyLoss()
+    weight = (
+        class_weights.clone().detach().to(device) if class_weights is not None else None
+    )
+    criterion = nn.CrossEntropyLoss(weight=weight)
+    debug_lr = max(BASE_CLIENT_LR, DEBUG_SINGLE_CLIENT_LR)
     optimizer = torch.optim.SGD(
-        model.parameters(), lr=BASE_CLIENT_LR, momentum=0.9, weight_decay=1e-4
+        model.parameters(), lr=debug_lr, momentum=0.9, weight_decay=1e-4
     )
     scaler = amp.GradScaler(enabled=MIXED_PRECISION)
 
@@ -824,7 +842,10 @@ def run_single_client_debug(trainloader, testloader, num_classes):
         model.train()
         running_loss = 0.0
         steps = 0
-        for x_batch, y_batch in trainloader:
+        max_steps = min(len(trainloader), MAX_LOCAL_UPDATES_PER_EPOCH)
+        for step_idx, (x_batch, y_batch) in enumerate(trainloader):
+            if step_idx >= max_steps:
+                break
             x_batch = x_batch.to(device, non_blocking=True)
             y_batch = y_batch.to(device, non_blocking=True)
             optimizer.zero_grad(set_to_none=True)
@@ -879,6 +900,7 @@ def run_async_oasis():
             trainloader_lst[0],
             testloader,
             num_classes,
+            class_weights,
         )
         return
 
