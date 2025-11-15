@@ -23,6 +23,12 @@ from utils.model import OASISNet
 from utils.utils import Utils
 
 # -----------------------------------------------------------------------------
+BASE_DIR = Path(__file__).resolve().parent
+DOC_DIR = BASE_DIR / "doc"
+LOG_DIR = DOC_DIR / "logs"
+IMAGE_DIR = DOC_DIR / "images"
+for _path in (DOC_DIR, LOG_DIR, IMAGE_DIR):
+    _path.mkdir(parents=True, exist_ok=True)
 # Reproducibility and device config
 # -----------------------------------------------------------------------------
 torch.manual_seed(0)
@@ -34,9 +40,9 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # -----------------------------------------------------------------------------
 # OASIS-specific configuration
 # -----------------------------------------------------------------------------
-OASIS_DATA_ROOT = Path("./imagesoasis")
-NUM_CLASSES = 4
 IMAGE_SIZE = 128
+NUM_CLASSES = 4
+OASIS_DATA_ROOT = BASE_DIR / "imagesoasis"
 TRAIN_RATIO = 0.7
 VAL_RATIO = 0.15
 TEST_RATIO = 0.15
@@ -52,14 +58,14 @@ TEST_BATCH_SIZE = 32
 RUN_MODE = "async"
 PAUSE_DURING_UNLEARN = True
 STALENESS_LAMBDA = 0.25
-SIM_MIN_SLEEP = 0.05
-SIM_MAX_SLEEP = 0.3
-ASYNC_SNAPSHOT_KEEP = 30
-ASYNC_EVAL_INTERVAL = 1
-ASYNC_MAX_VERSION = 80
-ASYNC_UNLEARN_TRIGGER = 35
-BASE_CLIENT_LR = 5e-4
-POST_UNLEARN_LR = 3e-4
+SIM_MIN_SLEEP = 0.0
+SIM_MAX_SLEEP = 0.2
+ASYNC_SNAPSHOT_KEEP = 20
+ASYNC_EVAL_INTERVAL = 3
+ASYNC_MAX_VERSION = 40
+ASYNC_UNLEARN_TRIGGER = 20
+BASE_CLIENT_LR = 1e-3
+POST_UNLEARN_LR = 1e-4
 POST_UNLEARN_MAX_UPDATES = None
 ASYNC_STOP_AFTER_UNLEARN_ROUNDS = 30
 UNLEARN_LR = 1e-3
@@ -79,7 +85,16 @@ def clone_state_dict(state_dict):
 
 
 def subtract_state_dict(state_a, state_b):
-    return {k: state_a[k] - state_b[k] for k in state_a}
+    delta = {}
+    for key, tensor_a in state_a.items():
+        tensor_b = state_b[key]
+        if not torch.is_floating_point(tensor_a):
+            continue
+        delta_tensor = tensor_a - tensor_b.to(tensor_a.device)
+        if delta_tensor.dtype != tensor_a.dtype:
+            delta_tensor = delta_tensor.to(tensor_a.dtype)
+        delta[key] = delta_tensor
+    return delta
 
 
 def apply_oasis_backdoor_pattern(x: torch.Tensor, intensity_scale: float = 1.8,
@@ -291,8 +306,18 @@ def create_oasis_dataloaders_for_federated(num_parties: int,
 class FusionAsync:
     def apply_update(self, model, delta_state, weight):
         with torch.no_grad():
-            for name, param in model.state_dict().items():
-                param.add_(weight * delta_state[name].to(param.device))
+            model_state = model.state_dict()
+            for name, param in model_state.items():
+                if name not in delta_state:
+                    continue
+                if not torch.is_floating_point(param):
+                    continue
+                update_tensor = delta_state[name].to(param.device)
+                if not torch.is_floating_point(update_tensor):
+                    update_tensor = update_tensor.to(param.dtype)
+                if update_tensor.dtype != param.dtype:
+                    update_tensor = update_tensor.to(param.dtype)
+                param.add_(weight * update_tensor)
 
 
 class AsyncServer:
@@ -650,7 +675,7 @@ class UnlearnWorker(threading.Thread):
 # -----------------------------------------------------------------------------
 def run_async_experiment():
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_filename = f"federated-unlearning/doc/logs/async_oasis_log_{timestamp}.log"
+    log_filename = LOG_DIR / f"async_oasis_log_{timestamp}.log"
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s - %(message)s",
@@ -754,7 +779,6 @@ def run_async_experiment():
                     reference_version=reference_version,
                 )
                 worker.start()
-                worker.join()
                 server.wait_for_unlearn_completion()
 
                 snapshot_state, snapshot_version = server.get_snapshot()
@@ -787,30 +811,35 @@ def run_async_experiment():
                     for client in clients:
                         client.resume()
 
-                if not post_unlearn_adjustment_done:
+                if unlearn_triggered and not post_unlearn_adjustment_done:
                     for client in clients:
-                        client.set_lr(POST_UNLEARN_LR)
-                        client.set_local_training_config(num_local_epochs=1,
-                                                         num_updates_in_epoch=POST_UNLEARN_MAX_UPDATES)
+                        if client.client_id != party_to_be_erased:
+                            client.set_lr(POST_UNLEARN_LR)
+                            if POST_UNLEARN_MAX_UPDATES is not None:
+                                client.set_local_training_config(
+                                    num_updates_in_epoch=POST_UNLEARN_MAX_UPDATES
+                                )
                     post_unlearn_adjustment_done = True
+                    # The continue was preventing post-unlearn evaluations.
+                    # continue
 
-                unlearn_triggered = True
-
-            for version_to_eval in server.drain_eval_requests():
-                if version_to_eval in recorded_versions:
-                    continue
-                snapshot_state, snapshot_version = server.get_snapshot(version_to_eval)
-                eval_model = build_model()
-                eval_model.load_state_dict(snapshot_state)
-                clean_acc = Utils.evaluate(testloader, eval_model)
-                pois_acc = Utils.evaluate(testloader_poison, eval_model)
-                logging.info(
-                    f"[ASYNC-EVAL] version={snapshot_version} | Clean={clean_acc:.2f} | Backdoor={pois_acc:.2f}"
-                )
-                eval_versions.append(snapshot_version)
-                clean_history.append(clean_acc)
-                poison_history.append(pois_acc)
-                recorded_versions.add(snapshot_version)
+            eval_versions_to_run = server.drain_eval_requests()
+            if eval_versions_to_run:
+                for version_to_eval in eval_versions_to_run:
+                    if version_to_eval in recorded_versions:
+                        continue
+                    snapshot_state, snapshot_version = server.get_snapshot(version_to_eval)
+                    eval_model = build_model()
+                    eval_model.load_state_dict(snapshot_state)
+                    clean_acc = Utils.evaluate(testloader, eval_model)
+                    pois_acc = Utils.evaluate(testloader_poison, eval_model)
+                    logging.info(
+                        f"[ASYNC-EVAL] version={snapshot_version} | Clean={clean_acc:.2f} | Backdoor={pois_acc:.2f}"
+                    )
+                    eval_versions.append(snapshot_version)
+                    clean_history.append(clean_acc)
+                    poison_history.append(pois_acc)
+                    recorded_versions.add(snapshot_version)
 
             if (
                 unlearn_triggered
