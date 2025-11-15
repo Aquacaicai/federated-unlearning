@@ -51,6 +51,7 @@ BACKDOOR_TARGET_CLASS = 3
 BACKDOOR_FRACTION = 0.75
 CLIENT_BATCH_SIZE = 16
 TEST_BATCH_SIZE = 32
+MINI_EVAL_MAX_PER_CLASS = 200
 
 # -----------------------------------------------------------------------------
 # Async FL configuration
@@ -297,7 +298,71 @@ def create_oasis_dataloaders_for_federated(num_parties: int,
     test_poison_dataset = BackdoorTestDataset(eval_dataset, test_indices, BACKDOOR_TARGET_CLASS)
     testloader_poison = DataLoader(test_poison_dataset, batch_size=TEST_BATCH_SIZE, shuffle=False)
 
-    return trainloaders, testloader, testloader_poison, class_weights
+    # Build a lightweight validation split for fast async evaluations.
+    rng = np.random.default_rng(42)
+    test_labels = np.array(eval_dataset.targets)[test_indices]
+    mini_eval_indices: List[int] = []
+    total_target = min(len(test_indices), MINI_EVAL_MAX_PER_CLASS * NUM_CLASSES)
+    class_counts = {cls: int((test_labels == cls).sum()) for cls in range(NUM_CLASSES)}
+    # Preserve class proportions while capping samples per class for mini-val.
+    desired_counts = {}
+    for cls in range(NUM_CLASSES):
+        if class_counts[cls] == 0:
+            desired_counts[cls] = 0
+            continue
+        proportional = max(1, int(round(class_counts[cls] / len(test_indices) * total_target)))
+        desired_counts[cls] = min(class_counts[cls], MINI_EVAL_MAX_PER_CLASS, proportional)
+
+    current_total = sum(desired_counts.values())
+    # Adjust counts to match the total target if rounding introduced drift.
+    if current_total < total_target:
+        deficit = total_target - current_total
+        for cls in sorted(range(NUM_CLASSES), key=lambda c: class_counts[c] - desired_counts[c], reverse=True):
+            if deficit <= 0:
+                break
+            available = min(class_counts[cls] - desired_counts[cls], MINI_EVAL_MAX_PER_CLASS - desired_counts[cls])
+            if available <= 0:
+                continue
+            increment = min(available, deficit)
+            desired_counts[cls] += increment
+            deficit -= increment
+    elif current_total > total_target:
+        surplus = current_total - total_target
+        for cls in sorted(range(NUM_CLASSES), key=lambda c: desired_counts[c], reverse=True):
+            if surplus <= 0:
+                break
+            reducible = desired_counts[cls] - 1
+            if reducible <= 0:
+                continue
+            decrement = min(reducible, surplus)
+            desired_counts[cls] -= decrement
+            surplus -= decrement
+
+    for cls in range(NUM_CLASSES):
+        cls_positions = np.where(test_labels == cls)[0]
+        if len(cls_positions) == 0 or desired_counts.get(cls, 0) == 0:
+            continue
+        rng.shuffle(cls_positions)
+        take = desired_counts[cls]
+        selected = cls_positions[:take]
+        mini_eval_indices.extend(test_indices[selected].tolist())
+
+    if not mini_eval_indices:
+        mini_eval_indices = test_indices.tolist()
+
+    mini_eval_dataset = IndexedDataset(eval_dataset, mini_eval_indices)
+    mini_clean_loader = DataLoader(mini_eval_dataset, batch_size=TEST_BATCH_SIZE, shuffle=False)
+    mini_poison_dataset = BackdoorTestDataset(eval_dataset, mini_eval_indices, BACKDOOR_TARGET_CLASS)
+    mini_poison_loader = DataLoader(mini_poison_dataset, batch_size=TEST_BATCH_SIZE, shuffle=False)
+
+    return (
+        trainloaders,
+        testloader,
+        testloader_poison,
+        mini_clean_loader,
+        mini_poison_loader,
+        class_weights,
+    )
 
 
 # -----------------------------------------------------------------------------
@@ -688,10 +753,14 @@ def run_async_experiment():
     num_parties = 5
     party_to_be_erased = 0
 
-    (trainloader_lst,
-     testloader,
-     testloader_poison,
-     class_weights) = create_oasis_dataloaders_for_federated(
+    (
+        trainloader_lst,
+        testloader_full,
+        testloader_poison_full,
+        mini_clean_loader,
+        mini_poison_loader,
+        class_weights,
+    ) = create_oasis_dataloaders_for_federated(
         num_parties=num_parties,
         party_to_be_erased=party_to_be_erased,
         batch_size=CLIENT_BATCH_SIZE,
@@ -701,7 +770,24 @@ def run_async_experiment():
     criterion = nn.CrossEntropyLoss(weight=class_weights.to(device)).to(device)
 
     async_initial_model = build_model()
-    server = AsyncServer(async_initial_model.state_dict(), num_parties,
+    initial_state = copy.deepcopy(async_initial_model.state_dict())
+
+    # Run expensive evaluation once before async threads start to avoid version drift.
+    eval_model = build_model()
+    eval_model.load_state_dict(initial_state)
+    init_clean = Utils.evaluate(testloader_full, eval_model)
+    init_pois = Utils.evaluate(testloader_poison_full, eval_model)
+    logging.info(
+        f"[INIT-EVAL] version=0 | Clean={init_clean:.2f} | Backdoor={init_pois:.2f}"
+    )
+
+    eval_versions: List[int] = [0]
+    clean_history: List[float] = [init_clean]
+    poison_history: List[float] = [init_pois]
+    recorded_versions = {0}
+    reference_version = None
+
+    server = AsyncServer(initial_state, num_parties,
                          model_builder=build_model,
                          pause_during_unlearn=PAUSE_DURING_UNLEARN,
                          staleness_lambda=STALENESS_LAMBDA,
@@ -730,24 +816,7 @@ def run_async_experiment():
         clients.append(client)
         client.start()
 
-    eval_versions: List[int] = []
-    clean_history: List[float] = []
-    poison_history: List[float] = []
-    recorded_versions = set()
-
-    init_state, init_version = server.get_snapshot()
-    eval_model = build_model()
-    eval_model.load_state_dict(init_state)
-    init_clean = Utils.evaluate(testloader, eval_model)
-    init_pois = Utils.evaluate(testloader_poison, eval_model)
-    logging.info(f"[ASYNC-EVAL] version={init_version} | Clean={init_clean:.2f} | Backdoor={init_pois:.2f}")
-    eval_versions.append(init_version)
-    clean_history.append(init_clean)
-    poison_history.append(init_pois)
-    recorded_versions.add(init_version)
-
     unlearn_triggered = False
-    reference_version = None
     erased_client_removed = False
     post_unlearn_stop_version = None
     post_unlearn_adjustment_done = False
@@ -784,8 +853,8 @@ def run_async_experiment():
                 snapshot_state, snapshot_version = server.get_snapshot()
                 eval_model = build_model()
                 eval_model.load_state_dict(snapshot_state)
-                post_clean = Utils.evaluate(testloader, eval_model)
-                post_pois = Utils.evaluate(testloader_poison, eval_model)
+                post_clean = Utils.evaluate(testloader_full, eval_model)
+                post_pois = Utils.evaluate(testloader_poison_full, eval_model)
                 logging.info(
                     f"[POST-UNLEARN-EVAL] version={snapshot_version} | Clean={post_clean:.2f} | Backdoor={post_pois:.2f}"
                 )
@@ -811,7 +880,9 @@ def run_async_experiment():
                     for client in clients:
                         client.resume()
 
-                if unlearn_triggered and not post_unlearn_adjustment_done:
+                unlearn_triggered = True
+
+                if not post_unlearn_adjustment_done:
                     for client in clients:
                         if client.client_id != party_to_be_erased:
                             client.set_lr(POST_UNLEARN_LR)
@@ -820,8 +891,6 @@ def run_async_experiment():
                                     num_updates_in_epoch=POST_UNLEARN_MAX_UPDATES
                                 )
                     post_unlearn_adjustment_done = True
-                    # The continue was preventing post-unlearn evaluations.
-                    # continue
 
             eval_versions_to_run = server.drain_eval_requests()
             if eval_versions_to_run:
@@ -831,8 +900,8 @@ def run_async_experiment():
                     snapshot_state, snapshot_version = server.get_snapshot(version_to_eval)
                     eval_model = build_model()
                     eval_model.load_state_dict(snapshot_state)
-                    clean_acc = Utils.evaluate(testloader, eval_model)
-                    pois_acc = Utils.evaluate(testloader_poison, eval_model)
+                    clean_acc = Utils.evaluate(mini_clean_loader, eval_model)
+                    pois_acc = Utils.evaluate(mini_poison_loader, eval_model)
                     logging.info(
                         f"[ASYNC-EVAL] version={snapshot_version} | Clean={clean_acc:.2f} | Backdoor={pois_acc:.2f}"
                     )
@@ -861,7 +930,7 @@ def run_async_experiment():
     plt.plot(eval_versions, clean_history, "r-o", linewidth=2, label="Clean Accuracy")
     plt.plot(eval_versions, poison_history, "b-x", linewidth=2, label="Backdoor Accuracy")
     if unlearn_triggered and reference_version is not None:
-        plt.axvline(x=reference_version + 1, linestyle="--", color="k", label="Unlearn Event")
+        plt.axvline(x=reference_version, linestyle="--", color="k", label="Unlearn Event")
     plt.xlabel("Global Version")
     plt.ylabel("Accuracy (%)")
     plt.grid(True)
