@@ -297,7 +297,8 @@ class FusionAsync:
 
 class AsyncServer:
     def __init__(self, initial_state, num_clients, model_builder: Callable[[], nn.Module],
-                 pause_during_unlearn=True, staleness_lambda=0.1, snapshot_keep=10):
+                 pause_during_unlearn=True, staleness_lambda=0.1, snapshot_keep=10,
+                 eval_interval: int = ASYNC_EVAL_INTERVAL):
         self.model_builder = model_builder
         self.global_model = self.model_builder()
         self.global_model.load_state_dict(copy.deepcopy(initial_state))
@@ -318,6 +319,8 @@ class AsyncServer:
         self.is_unlearning = False
         self.unlearn_complete_event = threading.Event()
         self.processing_thread = None
+        self.eval_interval = max(1, eval_interval)
+        self.eval_request_queue: "queue.Queue[int]" = queue.Queue()
 
         self.save_snapshot(self.global_version, copy.deepcopy(self.global_model.state_dict()))
 
@@ -446,6 +449,8 @@ class AsyncServer:
             logging.info(
                 f"[SERVER] version={self.global_version} | staleness={staleness} | w={weight:.3f}"
             )
+            if self.global_version % self.eval_interval == 0:
+                self.eval_request_queue.put(self.global_version)
 
     def _apply_unlearn(self, payload):
         state_dict = payload["state_dict"]
@@ -464,6 +469,19 @@ class AsyncServer:
             self.is_unlearning = False
             self.unlearn_complete_event.set()
             logging.info(f"[EVENT] Unlearning applied -> global_version={self.global_version}")
+            if self.global_version % self.eval_interval == 0:
+                self.eval_request_queue.put(self.global_version)
+
+    def drain_eval_requests(self) -> List[int]:
+        pending_versions: List[int] = []
+        while True:
+            try:
+                version = self.eval_request_queue.get_nowait()
+                pending_versions.append(version)
+                self.eval_request_queue.task_done()
+            except queue.Empty:
+                break
+        return pending_versions
 
 
 class ClientSimulator:
@@ -662,7 +680,8 @@ def run_async_experiment():
                          model_builder=build_model,
                          pause_during_unlearn=PAUSE_DURING_UNLEARN,
                          staleness_lambda=STALENESS_LAMBDA,
-                         snapshot_keep=ASYNC_SNAPSHOT_KEEP)
+                         snapshot_keep=ASYNC_SNAPSHOT_KEEP,
+                         eval_interval=ASYNC_EVAL_INTERVAL)
     server.start()
 
     clients: List[ClientSimulator] = []
@@ -777,8 +796,10 @@ def run_async_experiment():
 
                 unlearn_triggered = True
 
-            if current_version % ASYNC_EVAL_INTERVAL == 0 and current_version not in recorded_versions:
-                snapshot_state, snapshot_version = server.get_snapshot()
+            for version_to_eval in server.drain_eval_requests():
+                if version_to_eval in recorded_versions:
+                    continue
+                snapshot_state, snapshot_version = server.get_snapshot(version_to_eval)
                 eval_model = build_model()
                 eval_model.load_state_dict(snapshot_state)
                 clean_acc = Utils.evaluate(testloader, eval_model)
