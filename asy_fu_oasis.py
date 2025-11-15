@@ -15,7 +15,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from torch import nn
-from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
+from torch.utils.data import DataLoader, Dataset
 from torchvision import datasets, transforms
 
 from utils.local_train import LocalTraining
@@ -48,7 +48,7 @@ VAL_RATIO = 0.15
 TEST_RATIO = 0.15
 DIRICHLET_ALPHA = 0.3
 BACKDOOR_TARGET_CLASS = 3
-BACKDOOR_FRACTION = 0.75
+BACKDOOR_FRACTION = 1.0
 CLIENT_BATCH_SIZE = 16
 TEST_BATCH_SIZE = 32
 MINI_EVAL_MAX_PER_CLASS = 200
@@ -58,17 +58,17 @@ MINI_EVAL_MAX_PER_CLASS = 200
 # -----------------------------------------------------------------------------
 RUN_MODE = "async"
 PAUSE_DURING_UNLEARN = True
-STALENESS_LAMBDA = 0.25
+STALENESS_LAMBDA = 0.15
 SIM_MIN_SLEEP = 0.0
 SIM_MAX_SLEEP = 0.2
 ASYNC_SNAPSHOT_KEEP = 20
 ASYNC_EVAL_INTERVAL = 3
-ASYNC_MAX_VERSION = 40
-ASYNC_UNLEARN_TRIGGER = 20
+ASYNC_MAX_VERSION = 60
+ASYNC_UNLEARN_TRIGGER = 30
 BASE_CLIENT_LR = 1e-3
 POST_UNLEARN_LR = 1e-4
 POST_UNLEARN_MAX_UPDATES = None
-ASYNC_STOP_AFTER_UNLEARN_ROUNDS = 30
+ASYNC_STOP_AFTER_UNLEARN_ROUNDS = 40
 UNLEARN_LR = 1e-3
 UNLEARN_EPOCHS = 2
 UNLEARN_CLIP = 3.0
@@ -177,11 +177,14 @@ def compute_class_weights(labels: np.ndarray, num_classes: int) -> torch.Tensor:
 
 
 def build_weighted_loader(dataset: IndexedDataset, batch_size: int) -> DataLoader:
-    label_counts = np.bincount(dataset.labels, minlength=NUM_CLASSES)
-    weights = 1.0 / label_counts[dataset.labels]
-    sample_weights = torch.DoubleTensor(weights)
-    sampler = WeightedRandomSampler(sample_weights, num_samples=len(sample_weights), replacement=True)
-    return DataLoader(dataset, batch_size=batch_size, sampler=sampler, drop_last=False)
+    """Build a standard shuffled loader (Weighted sampler removed for stability)."""
+    # NOTE: changed to remove WeightedRandomSampler as it over-amplified rare classes.
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        drop_last=False,
+    )
 
 
 def stratified_split_indices(labels: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -802,13 +805,14 @@ def run_async_experiment():
         factor = speed_factors[client_id]
         min_delay = SIM_MIN_SLEEP * factor
         max_delay = max(min_delay + 0.02, SIM_MAX_SLEEP * factor)
+        local_epochs = 2 if client_id == party_to_be_erased else 1  # NOTE: amplify erased client's impact
         client = ClientSimulator(
             client_id=client_id,
             trainloader=trainloader_lst[client_id],
             server=server,
             model_builder=build_model,
             criterion=criterion,
-            num_local_epochs=1,
+            num_local_epochs=local_epochs,
             num_updates_in_epoch=None,
             compute_speed=(min_delay, max_delay),
             base_lr=BASE_CLIENT_LR,
