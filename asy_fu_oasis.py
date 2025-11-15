@@ -47,7 +47,8 @@ TRAIN_RATIO = 0.7
 VAL_RATIO = 0.15
 TEST_RATIO = 0.15
 DIRICHLET_ALPHA = 0.3
-BACKDOOR_TARGET_CLASS = 3
+# Target a more common class so the backdoor signal persists longer in async training.
+BACKDOOR_TARGET_CLASS = 1
 BACKDOOR_FRACTION = 1.0
 CLIENT_BATCH_SIZE = 16
 TEST_BATCH_SIZE = 32
@@ -65,12 +66,14 @@ ASYNC_SNAPSHOT_KEEP = 20
 ASYNC_EVAL_INTERVAL = 3
 ASYNC_MAX_VERSION = 60
 ASYNC_UNLEARN_TRIGGER = 30
-BASE_CLIENT_LR = 1e-3
+BASE_CLIENT_LR = 1e-4
 POST_UNLEARN_LR = 1e-4
 POST_UNLEARN_MAX_UPDATES = None
 ASYNC_STOP_AFTER_UNLEARN_ROUNDS = 40
-UNLEARN_LR = 1e-3
-UNLEARN_EPOCHS = 2
+# Use a much smaller LR/epoch count so gradient-ascent unlearning removes the backdoor
+# without collapsing general knowledge.
+UNLEARN_LR = 1e-5
+UNLEARN_EPOCHS = 1
 UNLEARN_CLIP = 3.0
 
 
@@ -177,12 +180,25 @@ def compute_class_weights(labels: np.ndarray, num_classes: int) -> torch.Tensor:
 
 
 def build_weighted_loader(dataset: IndexedDataset, batch_size: int) -> DataLoader:
-    """Build a standard shuffled loader (Weighted sampler removed for stability)."""
-    # NOTE: changed to remove WeightedRandomSampler as it over-amplified rare classes.
+    """Build a loader with clipped WeightedRandomSampler to counter long-tail imbalance."""
+    labels = np.array(dataset.labels, dtype=np.int64)
+    class_counts = np.bincount(labels, minlength=NUM_CLASSES)
+    class_counts = np.where(class_counts == 0, 1, class_counts)
+    class_weights = 1.0 / class_counts
+    sample_weights = class_weights[labels]
+    median_weight = float(np.median(sample_weights))
+    max_allowed = median_weight * 4.0
+    # Cap the per-sample weights so ultra-rare samples are not oversampled excessively.
+    sample_weights = np.clip(sample_weights, a_min=None, a_max=max_allowed)
+    sampler = torch.utils.data.WeightedRandomSampler(
+        weights=torch.tensor(sample_weights, dtype=torch.double),
+        num_samples=len(dataset),
+        replacement=True,
+    )
     return DataLoader(
         dataset,
         batch_size=batch_size,
-        shuffle=True,
+        sampler=sampler,
         drop_last=False,
     )
 
@@ -837,6 +853,20 @@ def run_async_experiment():
                     server.wait_for_update_queue()
 
                 reference_version = server.global_version
+                snapshot_state, snapshot_version = server.get_snapshot(reference_version)
+                eval_model = build_model()
+                eval_model.load_state_dict(snapshot_state)
+                pre_clean = Utils.evaluate(testloader_full, eval_model)
+                pre_pois = Utils.evaluate(testloader_poison_full, eval_model)
+                logging.info(
+                    f"[PRE-UNLEARN-EVAL] version={snapshot_version} | Clean={pre_clean:.2f} | Backdoor={pre_pois:.2f}"
+                )
+                if snapshot_version not in recorded_versions:
+                    eval_versions.append(snapshot_version)
+                    clean_history.append(pre_clean)
+                    poison_history.append(pre_pois)
+                    recorded_versions.add(snapshot_version)
+
                 server.begin_unlearning()
 
                 worker = UnlearnWorker(
