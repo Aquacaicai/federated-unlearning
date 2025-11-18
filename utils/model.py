@@ -26,7 +26,9 @@ class OASISNet(nn.Module):
     def __init__(self, num_classes: int = 4):
         super().__init__()
         self.features = nn.Sequential(
-            nn.Conv2d(1, 32, kernel_size=3, padding=1),
+            # Use 3-channel input to stay compatible with RGB MRI slices produced
+            # by the OASIS preprocessing pipeline.
+            nn.Conv2d(3, 32, kernel_size=3, padding=1),
             nn.BatchNorm2d(32),
             nn.ReLU(inplace=True),
             nn.MaxPool2d(2),
