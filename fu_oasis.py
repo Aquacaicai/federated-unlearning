@@ -287,11 +287,13 @@ poison_ratio = 0.6  # softer backdoor ratio to preserve clean accuracy
 target_label = 0
 
 # Training/Unlearning hyperparameters
-num_local_epochs_unlearn = 1
-unlearning_lr = 1e-4
-distance_threshold = 1.0
+# Unlearning settings use a slightly larger LR and more updates to ensure
+# meaningful gradient ascent against the erased client's data on OASIS.
+num_local_epochs_unlearn = 2  # run at least one full epoch of ascent (2 by default)
+num_updates_in_epoch_unlearn = 50  # cap batches per epoch during unlearning to ensure tens of updates
+unlearning_lr = 2e-3  # larger than base LR to make backdoor forgetting effective on OASIS
+unlearn_distance_factor = 3.0  # adaptive early-stop: allow the model to move several times the initial ref distance
 clip_grad = 1.0
-max_unlearning_batches = 10
 num_fl_after_unlearn_rounds = 10
 num_updates_in_epoch_after = 50
 num_local_epochs_after = 1
@@ -447,9 +449,18 @@ for fusion_key in fusion_types:
     threshold = np.mean(dist_ref_random_lst) / 3
     print(f"Radius for model_ref: {threshold}")
     logging.info(f"Radius for model_ref: {threshold}")
-    dist_ref_party = Utils.get_distance(model_ref, party0_model)
-    print(f"Distance of Reference Model to party0_model: {dist_ref_party}")
-    logging.info(f"Distance of Reference Model to party0_model: {dist_ref_party}")
+    dist_ref_party0_init = Utils.get_distance(model_ref, party0_model)
+    print(f"Distance of Reference Model to party0_model: {dist_ref_party0_init}")
+    logging.info(
+        f"Distance of Reference Model to party0_model: {dist_ref_party0_init}"
+    )
+
+    # Adaptive early-stop threshold based on initial distance to the erased party.
+    distance_threshold = dist_ref_party0_init * unlearn_distance_factor
+    logging.info(
+        f"Initial distance model_ref <-> party0 = {dist_ref_party0_init}"
+    )
+    logging.info(f"Unlearning distance_threshold = {distance_threshold}")
 
     # --------------------- Unlearning ---------------------
     model = copy.deepcopy(model_ref)
@@ -503,9 +514,7 @@ for fusion_key in fusion_types:
                 flag = True
                 break
 
-            if num_updates_in_epoch is not None and batch_id >= num_updates_in_epoch:
-                break
-            if batch_id + 1 >= max_unlearning_batches:
+            if num_updates_in_epoch_unlearn is not None and batch_id >= num_updates_in_epoch_unlearn:
                 break
     # ------------------------------------------------------
 
