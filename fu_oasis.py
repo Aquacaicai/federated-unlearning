@@ -1,7 +1,9 @@
+import logging
 import copy
 import itertools
 import math
 import random
+from datetime import datetime
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -25,6 +27,26 @@ SEED = 0
 random.seed(SEED)
 np.random.seed(SEED)
 torch.manual_seed(SEED)
+
+# -----------------------------
+# Logging configuration
+# -----------------------------
+LOG_DIR = Path(__file__).resolve().parent.parent / "doc" / "logs"
+IMAGE_DIR = Path(__file__).resolve().parent.parent / "doc" / "images"
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+IMAGE_DIR.mkdir(parents=True, exist_ok=True)
+
+log_file_name = f"training_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+log_file_path = LOG_DIR / log_file_name
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler(log_file_path),
+        logging.StreamHandler(),
+    ],
+)
 
 # MNIST script uses CUDA directly; keep the behaviour but fall back to CPU when
 # unavailable so the script can still run in constrained environments.
@@ -67,7 +89,7 @@ def _load_balanced_oasis_images(base_dir: Path, max_per_class: int, image_size: 
 
     class_names = [
         "Non Demented",
-        "Very Mild Dementia",
+        "Very mild Dementia",
         "Mild Dementia",
         "Moderate Dementia",
     ]
@@ -249,7 +271,7 @@ def make_oasis_federated_loaders(
 # -----------------------------
 num_parties = 5
 party_to_be_erased = 0
-base_data_dir = Path("images") / "OASIS"  # Adjust to the actual dataset location
+base_data_dir = Path(__file__).resolve().parent / "imagesoasis"  # Adjust to the actual dataset location
 image_size = 128
 max_per_class = 2000  # increase data per class to stabilise training
 alpha = 1.0  # non-IID strength; increase toward IID for debugging
@@ -280,6 +302,7 @@ after_unlearn_lr = 2.5e-3
 # Data preparation
 # -----------------------------
 print("Preparing OASIS federated loaders...")
+logging.info("Preparing OASIS federated loaders...")
 trainloader_lst, testloader_clean, testloader_poison = make_oasis_federated_loaders(
     base_dir=base_data_dir,
     num_parties=num_parties,
@@ -292,6 +315,7 @@ trainloader_lst, testloader_clean, testloader_poison = make_oasis_federated_load
     poison_ratio=poison_ratio,
 )
 print("Data preparation complete.")
+logging.info("Data preparation complete.")
 
 
 # -----------------------------
@@ -355,9 +379,11 @@ for round_num in range(num_fl_rounds):
         clean_acc = Utils.evaluate(testloader_clean, eval_model)
         clean_accuracy[fusion_key][round_num] = clean_acc
         print(f"Global Clean Accuracy {fusion_key}, round {round_num} = {clean_acc}")
+        logging.info(f"Global Clean Accuracy {fusion_key}, round {round_num} = {clean_acc}")
         pois_acc = Utils.evaluate(testloader_poison, eval_model)
         pois_accuracy[fusion_key][round_num] = pois_acc
         print(f"Global Backdoor Accuracy {fusion_key}, round {round_num} = {pois_acc}")
+        logging.info(f"Global Backdoor Accuracy {fusion_key}, round {round_num} = {pois_acc}")
 
 for fusion_key in fusion_types:
     current_model_state_dict = model_dict[fusion_key]
@@ -365,8 +391,10 @@ for fusion_key in fusion_types:
     current_model.load_state_dict(current_model_state_dict)
     clean_acc = Utils.evaluate(testloader_clean, current_model)
     print(f"Clean Accuracy {fusion_key}: {clean_acc}")
+    logging.info(f"Clean Accuracy {fusion_key}: {clean_acc}")
     pois_acc = Utils.evaluate(testloader_poison, current_model)
     print(f"Backdoor Accuracy {fusion_key}: {pois_acc}")
+    logging.info(f"Backdoor Accuracy {fusion_key}: {pois_acc}")
 
 
 # -----------------------------
@@ -405,18 +433,23 @@ for fusion_key in fusion_types:
     eval_model = copy.deepcopy(model_ref)
     unlearn_clean_acc = Utils.evaluate(testloader_clean, eval_model)
     print(f"Clean Accuracy for Reference Model = {unlearn_clean_acc}")
+    logging.info(f"Clean Accuracy for Reference Model = {unlearn_clean_acc}")
     unlearn_pois_acc = Utils.evaluate(testloader_poison, eval_model)
     print(f"Backdoor Accuracy for Reference Model = {unlearn_pois_acc}")
+    logging.info(f"Backdoor Accuracy for Reference Model = {unlearn_pois_acc}")
 
     dist_ref_random_lst = []
     for _ in range(10):
         dist_ref_random_lst.append(Utils.get_distance(model_ref, OASISNet().to(device)))
 
     print(f"Mean distance of Reference Model to random: {np.mean(dist_ref_random_lst)}")
+    logging.info(f"Mean distance of Reference Model to random: {np.mean(dist_ref_random_lst)}")
     threshold = np.mean(dist_ref_random_lst) / 3
     print(f"Radius for model_ref: {threshold}")
+    logging.info(f"Radius for model_ref: {threshold}")
     dist_ref_party = Utils.get_distance(model_ref, party0_model)
     print(f"Distance of Reference Model to party0_model: {dist_ref_party}")
+    logging.info(f"Distance of Reference Model to party0_model: {dist_ref_party}")
 
     # --------------------- Unlearning ---------------------
     model = copy.deepcopy(model_ref)
@@ -434,6 +467,7 @@ for fusion_key in fusion_types:
     flag = False
     for epoch in range(num_local_epochs_unlearn):
         print("------------", epoch)
+        logging.info(f"------------ Unlearning Epoch {epoch} ------------")
         if flag:
             break
         for batch_id, (x_batch, y_batch) in enumerate(trainloader_lst[party_to_be_erased]):
@@ -463,6 +497,7 @@ for fusion_key in fusion_types:
 
             distance_ref_party_0 = Utils.get_distance(model, party0_model)
             print("Distance from the unlearned model to party 0:", distance_ref_party_0)
+            logging.info(f"Distance from the unlearned model to party 0: {distance_ref_party_0}")
 
             if distance_ref_party_0 > distance_threshold:
                 flag = True
@@ -481,9 +516,11 @@ for fusion_key in fusion_types:
     eval_model.load_state_dict(unlearned_model_dict[fusion_types_unlearn[1]])
     unlearn_clean_acc = Utils.evaluate(testloader_clean, eval_model)
     print(f"Clean Accuracy for UN-Local Model = {unlearn_clean_acc}")
+    logging.info(f"Clean Accuracy for UN-Local Model = {unlearn_clean_acc}")
     clean_accuracy_unlearn[fusion_types_unlearn[1]] = unlearn_clean_acc
     pois_unlearn_acc = Utils.evaluate(testloader_poison, eval_model)
     print(f"Backdoor Accuracy for UN-Local Model = {pois_unlearn_acc}")
+    logging.info(f"Backdoor Accuracy for UN-Local Model = {pois_unlearn_acc}")
     pois_accuracy_unlearn[fusion_types_unlearn[1]] = pois_unlearn_acc
 
 
@@ -541,9 +578,11 @@ for round_num in range(num_fl_after_unlearn_rounds):
         eval_model.load_state_dict(current_model_state_dict)
         unlearn_clean_acc = Utils.evaluate(testloader_clean, eval_model)
         print(f"Global Clean Accuracy {fusion_key}, round {round_num} = {unlearn_clean_acc}")
+        logging.info(f"Global Clean Accuracy {fusion_key}, round {round_num} = {unlearn_clean_acc}")
         clean_accuracy_unlearn_fl_after_unlearn[fusion_key][round_num] = unlearn_clean_acc
         unlearn_pois_acc = Utils.evaluate(testloader_poison, eval_model)
         print(f"Global Backdoor Accuracy {fusion_key}, round {round_num} = {unlearn_pois_acc}")
+        logging.info(f"Global Backdoor Accuracy {fusion_key}, round {round_num} = {unlearn_pois_acc}")
         pois_accuracy_unlearn_fl_after_unlearn[fusion_key][round_num] = unlearn_pois_acc
 
 
@@ -591,4 +630,9 @@ plt.grid()
 plt.ylim([0, 100])
 plt.xlim([1, num_fl_after_unlearn_rounds])
 plt.legend()
+
+image_file_name = f"unlearning_comparison_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+image_file_path = IMAGE_DIR / image_file_name
+plt.savefig(image_file_path)
+logging.info(f"Plot saved to {image_file_path}")
 plt.show()
