@@ -10,7 +10,8 @@ import torch
 from PIL import Image
 from sklearn.model_selection import train_test_split
 from torch import nn
-from torch.utils.data import DataLoader, TensorDataset, WeightedRandomSampler
+from torch.utils.data import DataLoader, Dataset, TensorDataset, WeightedRandomSampler
+from torchvision import transforms
 
 from utils.fusion import FusionAvg, FusionRetrain
 from utils.local_train import LocalTraining
@@ -99,6 +100,27 @@ def _load_balanced_oasis_images(base_dir: Path, max_per_class: int, image_size: 
     return images, labels
 
 
+class OASISAugmentedDataset(Dataset):
+    """Tensor-backed dataset with optional on-the-fly augmentation."""
+
+    def __init__(self, images: torch.Tensor, labels: torch.Tensor, transform=None):
+        self.images = images
+        self.labels = labels
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.images)
+
+    def __getitem__(self, idx):
+        x = self.images[idx]
+        y = self.labels[idx]
+        if self.transform is not None:
+            img = transforms.ToPILImage()(x)
+            img = self.transform(img)
+            x = img
+        return x, y
+
+
 def _dirichlet_split_indices(y_train: np.ndarray, num_parties: int, alpha: float):
     """Generate non-IID client splits using Dirichlet label skew."""
 
@@ -128,6 +150,7 @@ def _make_party_loader(
     party_id: int,
     party_to_be_erased: int,
     poison_ratio: float,
+    train_transform,
 ):
     """Create a party dataloader with optional backdoor injection and reweighting."""
 
@@ -148,7 +171,7 @@ def _make_party_loader(
         weights=sample_weights.double(), num_samples=len(sample_weights), replacement=True
     )
 
-    dataset = TensorDataset(x_tensor, y_tensor)
+    dataset = OASISAugmentedDataset(x_tensor, y_tensor, transform=train_transform)
     loader = DataLoader(dataset, batch_size=batch_size, sampler=sampler)
     return loader
 
@@ -157,12 +180,12 @@ def make_oasis_federated_loaders(
     base_dir: Path,
     num_parties: int,
     image_size: int = 128,
-    max_per_class: int = 400,
-    alpha: float = 0.5,
+    max_per_class: int = 2000,
+    alpha: float = 1.0,
     batch_size: int = 32,
     target_label: int = 0,
     party_to_be_erased: int = 0,
-    poison_ratio: float = 0.8,
+    poison_ratio: float = 0.6,
 ):
     """
     Load OASIS data, build a balanced subset, perform Dirichlet label-skew split,
@@ -179,6 +202,15 @@ def make_oasis_federated_loaders(
 
     indices_per_party = _dirichlet_split_indices(y_train, num_parties=num_parties, alpha=alpha)
 
+    train_transform = transforms.Compose(
+        [
+            transforms.RandomRotation(degrees=10),
+            transforms.RandomResizedCrop(size=image_size, scale=(0.9, 1.1)),
+            transforms.ColorJitter(brightness=0.1, contrast=0.1),
+            transforms.ToTensor(),
+        ]
+    )
+
     trainloader_lst = []
     for party_id, indices in enumerate(indices_per_party):
         x_party = x_train[indices]
@@ -191,6 +223,7 @@ def make_oasis_federated_loaders(
             party_id=party_id,
             party_to_be_erased=party_to_be_erased,
             poison_ratio=poison_ratio,
+            train_transform=train_transform,
         )
         trainloader_lst.append(loader)
 
@@ -218,26 +251,29 @@ num_parties = 5
 party_to_be_erased = 0
 base_data_dir = Path("images") / "OASIS"  # Adjust to the actual dataset location
 image_size = 128
-max_per_class = 400
-alpha = 0.5
+max_per_class = 2000  # increase data per class to stabilise training
+alpha = 1.0  # non-IID strength; increase toward IID for debugging
 batch_size = 32
 num_of_repeats = 1
-num_fl_rounds = 20
-num_local_epochs = 1
+num_fl_rounds = 30
+num_local_epochs = 2
 num_updates_in_epoch = None
+base_lr = 5e-3
 
 # Backdoor configuration
-poison_ratio = 0.8
+poison_ratio = 0.6  # softer backdoor ratio to preserve clean accuracy
 target_label = 0
 
 # Training/Unlearning hyperparameters
-num_local_epochs_unlearn = 5
-unlearning_lr = 1e-3
-distance_threshold = 2.2
-clip_grad = 5
-num_fl_after_unlearn_rounds = num_fl_rounds
+num_local_epochs_unlearn = 1
+unlearning_lr = 1e-4
+distance_threshold = 1.0
+clip_grad = 1.0
+max_unlearning_batches = 10
+num_fl_after_unlearn_rounds = 10
 num_updates_in_epoch_after = 50
 num_local_epochs_after = 1
+after_unlearn_lr = 2.5e-3
 
 
 # -----------------------------
@@ -294,7 +330,11 @@ for round_num in range(num_fl_rounds):
             else:
                 model = copy.deepcopy(current_model)
                 model_update, party_loss = local_training.train(
-                    model=model, trainloader=trainloader_lst[party_id], criterion=None, opt=None
+                    model=model,
+                    trainloader=trainloader_lst[party_id],
+                    criterion=None,
+                    opt=None,
+                    lr=base_lr,
                 )
 
                 party_models.append(copy.deepcopy(model_update))
@@ -352,16 +392,14 @@ for fusion_key in fusion_types:
     party_models = copy.deepcopy(party_models_dict[fusion_key])
     party0_model = copy.deepcopy(party_models[party_to_be_erased])
 
+    w_fed = nn.utils.parameters_to_vector(fedavg_model.parameters())
+    w_party0 = nn.utils.parameters_to_vector(party0_model.parameters())
+
     # Compute reference model: w_ref = N/(N-1) * w^T - 1/(N-1) * w^{T-1}_i
-    model_ref_vec = (
-        num_parties / (num_parties - 1)
-        * nn.utils.parameters_to_vector(fedavg_model.parameters())
-        - 1 / (num_parties - 1)
-        * nn.utils.parameters_to_vector(party0_model.parameters())
-    )
+    model_ref_vec = (num_parties / (num_parties - 1)) * w_fed - (1.0 / (num_parties - 1)) * w_party0
 
     # Compute threshold
-    model_ref = copy.deepcopy(initial_model)
+    model_ref = copy.deepcopy(fedavg_model)
     nn.utils.vector_to_parameters(model_ref_vec, model_ref.parameters())
 
     eval_model = copy.deepcopy(model_ref)
@@ -387,6 +425,12 @@ for fusion_key in fusion_types:
     opt = torch.optim.SGD(model.parameters(), lr=unlearning_lr, momentum=0.9)
 
     model.train()
+    for m in model.modules():
+        if isinstance(m, nn.BatchNorm2d):
+            m.eval()
+            m.weight.requires_grad_(True)
+            m.bias.requires_grad_(True)
+
     flag = False
     for epoch in range(num_local_epochs_unlearn):
         print("------------", epoch)
@@ -426,6 +470,8 @@ for fusion_key in fusion_types:
 
             if num_updates_in_epoch is not None and batch_id >= num_updates_in_epoch:
                 break
+            if batch_id + 1 >= max_unlearning_batches:
+                break
     # ------------------------------------------------------
 
     unlearned_model = copy.deepcopy(model)
@@ -458,7 +504,8 @@ for round_num in range(num_fl_after_unlearn_rounds):
     )
 
     for fusion_key in fusion_types_unlearn:
-        fusion = FL_round_fusion_selection(num_parties=num_parties - 1, fusion_key=fusion_key)
+        fusion_num_parties = num_parties if fusion_key == "Retrain" else num_parties - 1
+        fusion = FL_round_fusion_selection(num_parties=fusion_num_parties, fusion_key=fusion_key)
 
         current_model_state_dict = copy.deepcopy(unlearned_model_dict[fusion_key])
         current_model = OASISNet().to(device)
@@ -470,7 +517,11 @@ for round_num in range(num_fl_after_unlearn_rounds):
         for party_id in range(1, num_parties):
             model = copy.deepcopy(current_model)
             model_update, party_loss = local_training.train(
-                model=model, trainloader=trainloader_lst[party_id], criterion=None, opt=None
+                model=model,
+                trainloader=trainloader_lst[party_id],
+                criterion=None,
+                opt=None,
+                lr=after_unlearn_lr,
             )
 
             party_models.append(copy.deepcopy(model_update))
@@ -499,7 +550,7 @@ for round_num in range(num_fl_after_unlearn_rounds):
 # -----------------------------
 # Plotting
 # -----------------------------
-fl_rounds = [i for i in range(1, num_fl_rounds + 1)]
+fl_rounds = [i for i in range(1, num_fl_after_unlearn_rounds + 1)]
 
 plt.plot(
     fl_rounds,
@@ -538,6 +589,6 @@ plt.ylabel("Accuracy")
 plt.title("OASIS Federated Unlearning: Retrain vs Unlearn")
 plt.grid()
 plt.ylim([0, 100])
-plt.xlim([1, num_fl_rounds])
+plt.xlim([1, num_fl_after_unlearn_rounds])
 plt.legend()
 plt.show()
