@@ -57,16 +57,6 @@ class FusionRetrain(Fusion):
         
     # Currently, we assume that the party to be erased is party_id = 0
     def fusion_algo(self, party_models, current_model=None):
-        num_models = len(party_models)
-        if num_models == 0:
-            return current_model.state_dict() if current_model is not None else {}
-
-        if num_models == self.num_parties:
-            selected_parties = [i for i in range(1, num_models)]
-        elif num_models == self.num_parties - 1:
-            selected_parties = [i for i in range(num_models)]
-        else:
-            selected_parties = [i for i in range(1, num_models)] if num_models > 1 else [0]
-
+        selected_parties = [i for i in range(1,self.num_parties)]
         aggregated_model_state_dict = super().average_selected_models(selected_parties, party_models)
-        return aggregated_model_state_dict
+        return aggregated_model_state_dict 
