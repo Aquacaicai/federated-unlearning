@@ -2,6 +2,7 @@ import logging
 import copy
 import itertools
 import math
+import os
 import random
 from datetime import datetime
 from pathlib import Path
@@ -27,6 +28,8 @@ SEED = 0
 random.seed(SEED)
 np.random.seed(SEED)
 torch.manual_seed(SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
 
 # -----------------------------
 # Logging configuration
@@ -51,6 +54,13 @@ logging.basicConfig(
 # MNIST script uses CUDA directly; keep the behaviour but fall back to CPU when
 # unavailable so the script can still run in constrained environments.
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+if device.type == "cuda":
+    torch.backends.cudnn.benchmark = True
+
+_CPU_COUNT = os.cpu_count() or 1
+NUM_WORKERS_TRAIN = max(1, min(8, _CPU_COUNT))
+NUM_WORKERS_EVAL = max(1, min(4, _CPU_COUNT))
+PIN_MEMORY = device.type == "cuda"
 
 
 # -----------------------------
@@ -173,6 +183,8 @@ def _make_party_loader(
     party_to_be_erased: int,
     poison_ratio: float,
     train_transform,
+    num_workers: int,
+    pin_memory: bool,
 ):
     """Create a party dataloader with optional backdoor injection and reweighting."""
 
@@ -194,7 +206,14 @@ def _make_party_loader(
     )
 
     dataset = OASISAugmentedDataset(x_tensor, y_tensor, transform=train_transform)
-    loader = DataLoader(dataset, batch_size=batch_size, sampler=sampler)
+    loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        sampler=sampler,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=num_workers > 0,
+    )
     return loader
 
 
@@ -246,6 +265,8 @@ def make_oasis_federated_loaders(
             party_to_be_erased=party_to_be_erased,
             poison_ratio=poison_ratio,
             train_transform=train_transform,
+            num_workers=NUM_WORKERS_TRAIN,
+            pin_memory=PIN_MEMORY,
         )
         trainloader_lst.append(loader)
 
@@ -253,7 +274,14 @@ def make_oasis_federated_loaders(
     test_dataset = TensorDataset(
         torch.tensor(x_test, dtype=torch.float32), torch.tensor(y_test, dtype=torch.long)
     )
-    testloader_clean = DataLoader(test_dataset, batch_size=64, shuffle=False)
+    testloader_clean = DataLoader(
+        test_dataset,
+        batch_size=64,
+        shuffle=False,
+        num_workers=NUM_WORKERS_EVAL,
+        pin_memory=PIN_MEMORY,
+        persistent_workers=NUM_WORKERS_EVAL > 0,
+    )
 
     # Poisoned test loader: trigger on all samples with target_label
     poisoned_test_x = torch.tensor(x_test, dtype=torch.float32)
@@ -261,7 +289,14 @@ def make_oasis_federated_loaders(
     for idx in range(len(poisoned_test_x)):
         poisoned_test_x[idx] = add_oasis_trigger(poisoned_test_x[idx])
     poisoned_test_dataset = TensorDataset(poisoned_test_x, poisoned_test_y)
-    testloader_poison = DataLoader(poisoned_test_dataset, batch_size=64, shuffle=False)
+    testloader_poison = DataLoader(
+        poisoned_test_dataset,
+        batch_size=64,
+        shuffle=False,
+        num_workers=NUM_WORKERS_EVAL,
+        pin_memory=PIN_MEMORY,
+        persistent_workers=NUM_WORKERS_EVAL > 0,
+    )
 
     return trainloader_lst, testloader_clean, testloader_poison
 
@@ -289,7 +324,7 @@ target_label = 0
 # Training/Unlearning hyperparameters
 # Unlearning settings use a slightly larger LR and more updates to ensure
 # meaningful gradient ascent against the erased client's data on OASIS.
-num_local_epochs_unlearn = 2  # run at least one full epoch of ascent (2 by default)
+num_local_epochs_unlearn = 15  # run at least one full epoch of ascent (2 by default)
 num_updates_in_epoch_unlearn = 50  # cap batches per epoch during unlearning to ensure tens of updates
 unlearning_lr = 2e-3  # larger than base LR to make backdoor forgetting effective on OASIS
 unlearn_distance_factor = 3.0  # adaptive early-stop: allow the model to move several times the initial ref distance
