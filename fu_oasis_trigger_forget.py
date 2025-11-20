@@ -10,7 +10,6 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-from typing import Dict, Optional
 from PIL import Image
 from sklearn.model_selection import train_test_split
 from torch import nn
@@ -131,7 +130,7 @@ def build_trigger_loader(
         x_subset[idx] = trigger_fn(x_subset[idx])
 
     # All trigger samples are assigned to the attacker's target label.
-    y_subset = torch.full((num_samples,), target_label, dtype=torch.long)
+    y_subset = torch.full((len(x_subset),), target_label, dtype=torch.long)
 
     dataset = TensorDataset(x_subset, y_subset)
     loader = DataLoader(
@@ -262,70 +261,6 @@ def _dirichlet_split_indices(y_train: np.ndarray, num_parties: int, alpha: float
     return indices_per_party
 
 
-def _split_party_data_with_shift(
-    y_train: np.ndarray,
-    num_parties: int,
-    alpha_rest: float,
-    party0_label_weights: Dict[int, float],
-    party0_size_multiplier: float,
-):
-    """
-    Build party splits where party0 follows a bespoke label distribution.
-
-    The remaining parties still use the Dirichlet label-skew split from the
-    baseline fu_oasis.py implementation. party0 is carved out first to ensure its
-    label proportions are intentionally different (e.g., heavily biased toward
-    the target label). The size multiplier lets us keep party0 slightly larger so
-    its impact is felt during unlearning but does not dominate the federation.
-    """
-
-    total_size = len(y_train)
-    base_party_size = total_size // num_parties
-    desired_party0_size = int(base_party_size * party0_size_multiplier)
-
-    all_indices = np.arange(total_size)
-    rng = np.random.default_rng()
-
-    party0_indices = []
-    remaining_indices = set(all_indices.tolist())
-    for label, weight in party0_label_weights.items():
-        if weight <= 0:
-            continue
-        cls_indices = np.where(y_train == label)[0]
-        if len(cls_indices) == 0:
-            continue
-        take = min(len(cls_indices), math.ceil(desired_party0_size * weight))
-        chosen = rng.choice(cls_indices, size=take, replace=False).tolist()
-        party0_indices.extend(chosen)
-        remaining_indices.difference_update(chosen)
-
-    # Top up party0 with random leftovers if the weighted sample is small.
-    if len(party0_indices) < desired_party0_size:
-        gap = desired_party0_size - len(party0_indices)
-        remaining_list = list(remaining_indices)
-        if remaining_list:
-            extra = rng.choice(remaining_list, size=min(gap, len(remaining_list)), replace=False)
-            party0_indices.extend(extra.tolist())
-            remaining_indices.difference_update(extra.tolist())
-
-    party_indices = [[] for _ in range(num_parties)]
-    party_indices[0] = party0_indices
-
-    if num_parties == 1:
-        return party_indices
-
-    remaining_indices = np.array(list(remaining_indices))
-    remaining_labels = y_train[remaining_indices]
-
-    rest_splits = _dirichlet_split_indices(
-        remaining_labels, num_parties=num_parties - 1, alpha=alpha_rest
-    )
-    for party_id, indices in enumerate(rest_splits, start=1):
-        party_indices[party_id] = remaining_indices[indices].tolist()
-
-    return party_indices
-
-
 def _make_party_loader(
     x_party: np.ndarray,
     y_party: np.ndarray,
@@ -375,21 +310,14 @@ def make_oasis_federated_loaders(
     image_size: int = 128,
     max_per_class: int = 2000,
     alpha: float = 1.0,
-    alpha_party0: Optional[float] = None,
     batch_size: int = 32,
     target_label: int = 0,
     party_to_be_erased: int = 0,
     poison_ratio: float = 0.6,
-    party0_label_weights: Optional[Dict[int, float]] = None,
-    party0_size_multiplier: float = 1.2,
 ):
     """
     Load OASIS data, build a balanced subset, perform Dirichlet label-skew split,
     inject backdoor samples for the erased party, and prepare clean/poison test loaders.
-
-    party0 uses a custom non-IID distribution specified by ``party0_label_weights``.
-    Remaining parties retain the baseline Dirichlet split from fu_oasis.py to avoid
-    increasing the backdoor accuracy during post-learning.
     """
 
     images, labels = _load_balanced_oasis_images(
@@ -400,18 +328,7 @@ def make_oasis_federated_loaders(
         images, labels, test_size=0.15, stratify=labels, random_state=SEED
     )
 
-    effective_party0_weights = (
-        party0_label_weights
-        if party0_label_weights is not None
-        else {target_label: 0.7, 1: 0.15, 2: 0.1, 3: 0.05}
-    )
-    indices_per_party = _split_party_data_with_shift(
-        y_train=y_train,
-        num_parties=num_parties,
-        alpha_rest=alpha if alpha_party0 is None else alpha_party0,
-        party0_label_weights=effective_party0_weights,
-        party0_size_multiplier=party0_size_multiplier,
-    )
+    indices_per_party = _dirichlet_split_indices(y_train, num_parties=num_parties, alpha=alpha)
 
     train_transform = transforms.Compose(
         [
