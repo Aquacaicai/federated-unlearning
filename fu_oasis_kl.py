@@ -1,6 +1,8 @@
-import logging
+import argparse
 import copy
 import itertools
+import json
+import logging
 import math
 import os
 import random
@@ -27,37 +29,78 @@ from utils.utils import Utils
 # loss between clean and triggered predictions (Version B).
 
 # -----------------------------
+# Argument parsing
+# -----------------------------
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="OASIS Federated Unlearning")
+    parser.add_argument("--num_parties", type=int, default=5, help="Number of clients")
+    parser.add_argument("--seed", type=int, default=0, help="Random seed")
+    parser.add_argument("--num_fl_rounds", type=int, default=30, help="FL rounds before unlearning")
+    parser.add_argument(
+        "--num_fl_after_unlearn_rounds",
+        type=int,
+        default=10,
+        help="FL rounds after unlearning",
+    )
+    parser.add_argument("--num_local_epochs", type=int, default=2)
+    parser.add_argument("--num_updates_in_epoch", type=int, default=None)
+    parser.add_argument("--base_lr", type=float, default=5e-3)
+    parser.add_argument("--num_local_epochs_unlearn", type=int, default=15)
+    parser.add_argument("--num_updates_in_epoch_unlearn", type=int, default=50)
+    parser.add_argument("--unlearning_lr", type=float, default=2e-3)
+    parser.add_argument("--unlearn_distance_factor", type=float, default=3.0)
+    parser.add_argument("--clip_grad", type=float, default=1.0)
+    parser.add_argument("--num_local_epochs_after", type=int, default=1)
+    parser.add_argument("--num_updates_in_epoch_after", type=int, default=50)
+    parser.add_argument("--after_unlearn_lr", type=float, default=2.5e-3)
+    parser.add_argument("--alpha", type=float, default=1.0)
+    parser.add_argument("--poison_ratio", type=float, default=0.6)
+    parser.add_argument("--target_label", type=int, default=0)
+    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--image_size", type=int, default=128)
+    parser.add_argument("--max_per_class", type=int, default=2000)
+    parser.add_argument("--use_forget_loss", action="store_true", default=True)
+    parser.add_argument(
+        "--disable_forget_loss",
+        action="store_false",
+        dest="use_forget_loss",
+        help="Disable trigger forgetting updates",
+    )
+    parser.add_argument("--gamma_forget", type=float, default=1.0)
+    parser.add_argument("--trigger_num_samples", type=int, default=800)
+    parser.add_argument("--trigger_batch_size", type=int, default=64)
+    parser.add_argument("--trigger_optimizer_lr", type=float, default=2e-3)
+    parser.add_argument("--trigger_num_epochs", type=int, default=1)
+    parser.add_argument(
+        "--data_dir",
+        type=str,
+        default=str(Path(__file__).resolve().parent / "imagesoasis"),
+        help="OASIS dataset directory",
+    )
+    return parser.parse_args()
+
+
+# -----------------------------
 # Seeding and device selection
 # -----------------------------
-SEED = 0
-random.seed(SEED)
-np.random.seed(SEED)
-torch.manual_seed(SEED)
-if torch.cuda.is_available():
-    torch.cuda.manual_seed_all(SEED)
 
-# -----------------------------
-# Logging configuration
-# -----------------------------
-LOG_DIR = Path(__file__).resolve().parent.parent / "doc" / "logs"
-IMAGE_DIR = Path(__file__).resolve().parent.parent / "doc" / "images"
-LOG_DIR.mkdir(parents=True, exist_ok=True)
-IMAGE_DIR.mkdir(parents=True, exist_ok=True)
+def setup_seed(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
-log_file_name = f"training_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
-log_file_path = LOG_DIR / log_file_name
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.FileHandler(log_file_path),
-        logging.StreamHandler(),
-    ],
-)
+def setup_logging(log_path: Path):
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=[logging.FileHandler(log_path), logging.StreamHandler()],
+    )
 
-# MNIST script uses CUDA directly; keep the behaviour but fall back to CPU when
-# unavailable so the script can still run in constrained environments.
+
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 if device.type == "cuda":
     torch.backends.cudnn.benchmark = True
@@ -236,7 +279,6 @@ def _load_balanced_oasis_images(base_dir: Path, max_per_class: int, image_size: 
             labels.append(label)
 
     images = np.stack(images).astype(np.float32) / 255.0
-    # (N, 128, 128, 3) -> (N, 3, 128, 128)
     images = np.transpose(images, (0, 3, 1, 2))
     labels = np.array(labels, dtype=np.int64)
     return images, labels
@@ -337,6 +379,7 @@ def make_oasis_federated_loaders(
     target_label: int = 0,
     party_to_be_erased: int = 0,
     poison_ratio: float = 0.6,
+    seed: int = 0,
 ):
     """
     Load OASIS data, build a balanced subset, perform Dirichlet label-skew split,
@@ -348,7 +391,7 @@ def make_oasis_federated_loaders(
     )
 
     x_train, x_test, y_train, y_test = train_test_split(
-        images, labels, test_size=0.15, stratify=labels, random_state=SEED
+        images, labels, test_size=0.15, stratify=labels, random_state=seed
     )
 
     indices_per_party = _dirichlet_split_indices(y_train, num_parties=num_parties, alpha=alpha)
@@ -380,7 +423,6 @@ def make_oasis_federated_loaders(
         )
         trainloader_lst.append(loader)
 
-    # Clean test loader
     test_dataset = TensorDataset(
         torch.tensor(x_test, dtype=torch.float32), torch.tensor(y_test, dtype=torch.long)
     )
@@ -393,7 +435,6 @@ def make_oasis_federated_loaders(
         persistent_workers=NUM_WORKERS_EVAL > 0,
     )
 
-    # Poisoned test loader: trigger on all samples with target_label
     poisoned_test_x = torch.tensor(x_test, dtype=torch.float32)
     poisoned_test_y = torch.full_like(torch.tensor(y_test, dtype=torch.long), target_label)
     for idx in range(len(poisoned_test_x)):
@@ -415,439 +456,513 @@ def make_oasis_federated_loaders(
 
 
 # -----------------------------
-# Experiment configuration
+# Main training pipeline
 # -----------------------------
-num_parties = 5
-party_to_be_erased = 0
-base_data_dir = Path(__file__).resolve().parent / "imagesoasis"  # Adjust to the actual dataset location
-image_size = 128
-max_per_class = 2000  # increase data per class to stabilise training
-alpha = 1.0  # non-IID strength; increase toward IID for debugging
-batch_size = 32
-num_of_repeats = 1
-num_fl_rounds = 30
-num_local_epochs = 2
-num_updates_in_epoch = None
-base_lr = 5e-3
 
-# Backdoor configuration
-poison_ratio = 0.6  # softer backdoor ratio to preserve clean accuracy
-target_label = 0
-
-# Training/Unlearning hyperparameters
-# Unlearning settings use a slightly larger LR and more updates to ensure
-# meaningful gradient ascent against the erased client's data on OASIS.
-num_local_epochs_unlearn = 15  # run at least one full epoch of ascent (2 by default)
-num_updates_in_epoch_unlearn = 50  # cap batches per epoch during unlearning to ensure tens of updates
-unlearning_lr = 2e-3  # larger than base LR to make backdoor forgetting effective on OASIS
-unlearn_distance_factor = 3.0  # adaptive early-stop: allow the model to move several times the initial ref distance
-clip_grad = 1.0
-num_fl_after_unlearn_rounds = 10
-num_updates_in_epoch_after = 50
-num_local_epochs_after = 1
-after_unlearn_lr = 2.5e-3
-
-# Forgetting-loss configuration
-use_forget_loss = True
-gamma_forget = 1.0  # weight that controls how aggressively the trigger predictions are suppressed
-trigger_num_samples = 800  # size of D_trigger; larger improves signal but increases cost
-trigger_batch_size = 64
-trigger_optimizer_lr = 2e-3
-trigger_num_epochs = 1
+def save_experiment_config(exp_dir: Path, config: dict):
+    with open(exp_dir / "config.json", "w", encoding="utf-8") as f:
+        json.dump(config, f, indent=2)
 
 
-# -----------------------------
-# Data preparation
-# -----------------------------
-print("Preparing OASIS federated loaders...")
-logging.info("Preparing OASIS federated loaders...")
-(
-    trainloader_lst,
-    testloader_clean,
-    testloader_poison,
-    x_test_tensor,
-    y_test_tensor,
-) = make_oasis_federated_loaders(
-    base_dir=base_data_dir,
-    num_parties=num_parties,
-    image_size=image_size,
-    max_per_class=max_per_class,
-    alpha=alpha,
-    batch_size=batch_size,
-    target_label=target_label,
-    party_to_be_erased=party_to_be_erased,
-    poison_ratio=poison_ratio,
-)
-print("Data preparation complete.")
-logging.info("Data preparation complete.")
+def save_metrics(exp_dir: Path, metrics: dict):
+    np.savez(exp_dir / "metrics.npz", **metrics)
 
-trigger_loader = None
-if use_forget_loss:
-    trigger_loader = build_trigger_loader(
-        x_test_tensor=x_test_tensor,
-        y_test_tensor=y_test_tensor,
-        trigger_fn=add_oasis_trigger,
-        target_label=target_label,
-        num_samples=trigger_num_samples,
-        batch_size=trigger_batch_size,
+
+def main():
+    args = parse_args()
+    setup_seed(args.seed)
+
+    base_dir = Path(__file__).resolve().parent
+    exp_root = base_dir / "doc" / "experiments"
+    exp_name = (
+        f"oasis_np{args.num_parties}_"
+        f"unlep{args.num_local_epochs_unlearn}_"
+        f"seed{args.seed}_"
+        f"{datetime.now().strftime('%m%d-%H%M%S')}"
     )
-    if trigger_loader is not None:
-        logging.info(
-            "Constructed trigger loader with %d samples for forgetting loss",
-            len(trigger_loader.dataset),
+    exp_dir = exp_root / exp_name
+    checkpoint_dir = exp_dir / "checkpoints"
+    fig_dir = exp_dir / "figures"
+    for p in (exp_dir, checkpoint_dir, fig_dir):
+        p.mkdir(parents=True, exist_ok=True)
+
+    log_file_name = f"training_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+    log_file_path = exp_dir / log_file_name
+    setup_logging(log_file_path)
+
+    logging.info("Preparing OASIS federated loaders...")
+    (
+        trainloader_lst,
+        testloader_clean,
+        testloader_poison,
+        x_test_tensor,
+        y_test_tensor,
+    ) = make_oasis_federated_loaders(
+        base_dir=Path(args.data_dir),
+        num_parties=args.num_parties,
+        image_size=args.image_size,
+        max_per_class=args.max_per_class,
+        alpha=args.alpha,
+        batch_size=args.batch_size,
+        target_label=args.target_label,
+        party_to_be_erased=0,
+        poison_ratio=args.poison_ratio,
+        seed=args.seed,
+    )
+    logging.info("Data preparation complete.")
+
+    trigger_loader = None
+    if args.use_forget_loss:
+        trigger_loader = build_trigger_loader(
+            x_test_tensor=x_test_tensor,
+            y_test_tensor=y_test_tensor,
+            trigger_fn=add_oasis_trigger,
+            target_label=args.target_label,
+            num_samples=args.trigger_num_samples,
+            batch_size=args.trigger_batch_size,
         )
-    else:
-        logging.warning("Trigger loader construction skipped (no samples available).")
+        if trigger_loader is not None:
+            logging.info(
+                "Constructed trigger loader with %d samples for forgetting loss",
+                len(trigger_loader.dataset),
+            )
+        else:
+            logging.warning("Trigger loader construction skipped (no samples available).")
 
+    config = {
+        "num_parties": args.num_parties,
+        "seed": args.seed,
+        "num_fl_rounds": args.num_fl_rounds,
+        "num_fl_after_unlearn_rounds": args.num_fl_after_unlearn_rounds,
+        "num_local_epochs": args.num_local_epochs,
+        "num_local_epochs_unlearn": args.num_local_epochs_unlearn,
+        "num_updates_in_epoch": args.num_updates_in_epoch,
+        "num_updates_in_epoch_unlearn": args.num_updates_in_epoch_unlearn,
+        "alpha": args.alpha,
+        "base_lr": args.base_lr,
+        "unlearning_lr": args.unlearning_lr,
+        "after_unlearn_lr": args.after_unlearn_lr,
+        "use_forget_loss": args.use_forget_loss,
+        "gamma_forget": args.gamma_forget,
+        "trigger_num_samples": args.trigger_num_samples,
+        "trigger_batch_size": args.trigger_batch_size,
+        "trigger_optimizer_lr": args.trigger_optimizer_lr,
+        "trigger_num_epochs": args.trigger_num_epochs,
+        "unlearn_distance_factor": args.unlearn_distance_factor,
+        "clip_grad": args.clip_grad,
+        "num_local_epochs_after": args.num_local_epochs_after,
+        "num_updates_in_epoch_after": args.num_updates_in_epoch_after,
+        "poison_ratio": args.poison_ratio,
+        "target_label": args.target_label,
+        "batch_size": args.batch_size,
+        "image_size": args.image_size,
+        "max_per_class": args.max_per_class,
+        "data_dir": str(args.data_dir),
+    }
+    save_experiment_config(exp_dir, config)
 
-# -----------------------------
-# Phase 1: standard FL training (FedAvg + Retrain)
-# -----------------------------
-fusion_types = ["FedAvg", "Retrain"]
-fusion_types_unlearn = ["Retrain", "Unlearn"]
+    fusion_types = ["FedAvg", "Retrain"]
+    fusion_types_unlearn = ["Retrain", "Unlearn"]
 
-loss_fed = {fusion_key: np.zeros(num_fl_rounds) for fusion_key in fusion_types}
-clean_accuracy = {fusion_key: np.zeros(num_fl_rounds) for fusion_key in fusion_types}
-pois_accuracy = {fusion_key: np.zeros(num_fl_rounds) for fusion_key in fusion_types}
-dist_Retrain = {fusion_key: np.zeros(num_fl_rounds) for fusion_key in fusion_types if fusion_key != "Retrain"}
+    loss_fed = {fusion_key: np.zeros(args.num_fl_rounds) for fusion_key in fusion_types}
+    clean_accuracy = {fusion_key: np.zeros(args.num_fl_rounds) for fusion_key in fusion_types}
+    pois_accuracy = {fusion_key: np.zeros(args.num_fl_rounds) for fusion_key in fusion_types}
+    dist_Retrain = {fusion_key: np.zeros(args.num_fl_rounds) for fusion_key in fusion_types if fusion_key != "Retrain"}
 
-party_models_dict = {}
-initial_model = OASISNet().to(device)
-model_dict = {fusion_key: copy.deepcopy(initial_model.state_dict()) for fusion_key in fusion_types}
+    party_models_dict = {}
+    initial_model = OASISNet().to(device)
+    model_dict = {fusion_key: copy.deepcopy(initial_model.state_dict()) for fusion_key in fusion_types}
 
-for round_num in range(num_fl_rounds):
-    local_training = LocalTraining(
-        num_updates_in_epoch=num_updates_in_epoch, num_local_epochs=num_local_epochs
-    )
+    for round_num in range(args.num_fl_rounds):
+        local_training = LocalTraining(
+            num_updates_in_epoch=args.num_updates_in_epoch, num_local_epochs=args.num_local_epochs
+        )
 
-    for fusion_key in fusion_types:
-        fusion = FL_round_fusion_selection(num_parties=num_parties, fusion_key=fusion_key)
+        for fusion_key in fusion_types:
+            fusion = FL_round_fusion_selection(num_parties=args.num_parties, fusion_key=fusion_key)
 
-        current_model_state_dict = copy.deepcopy(model_dict[fusion_key])
-        current_model = copy.deepcopy(initial_model)
-        current_model.load_state_dict(current_model_state_dict)
+            current_model_state_dict = copy.deepcopy(model_dict[fusion_key])
+            current_model = OASISNet().to(device)
+            current_model.load_state_dict(current_model_state_dict)
 
-        # --------------------- Local Training Round ---------------------
-        party_models = []
-        party_losses = []
-        for party_id in range(num_parties):
-            if fusion_key == "Retrain" and party_id == party_to_be_erased:
-                party_models.append(OASISNet().to(device))
-            else:
+            party_models = []
+            party_losses = []
+            for party_id in range(args.num_parties):
                 model = copy.deepcopy(current_model)
                 model_update, party_loss = local_training.train(
                     model=model,
                     trainloader=trainloader_lst[party_id],
                     criterion=None,
                     opt=None,
-                    lr=base_lr,
+                    lr=args.base_lr,
                 )
 
                 party_models.append(copy.deepcopy(model_update))
                 party_losses.append(party_loss)
 
-        if len(party_losses) > 0:
-            loss_fed[fusion_key][round_num] += np.mean(party_losses) / num_of_repeats
-        # ----------------------------------------------------------------
+            if len(party_losses) > 0:
+                loss_fed[fusion_key][round_num] = np.mean(party_losses)
 
-        current_model_state_dict = fusion.fusion_algo(
-            party_models=party_models, current_model=current_model
-        )
-        model_dict[fusion_key] = copy.deepcopy(current_model_state_dict)
-        party_models_dict[fusion_key] = party_models
+            current_model_state_dict = fusion.fusion_algo(
+                party_models=party_models, current_model=current_model
+            )
+            model_dict[fusion_key] = copy.deepcopy(current_model_state_dict)
 
-        eval_model = OASISNet().to(device)
-        eval_model.load_state_dict(current_model_state_dict)
-        clean_acc = Utils.evaluate(testloader_clean, eval_model)
-        clean_accuracy[fusion_key][round_num] = clean_acc
-        print(f"Global Clean Accuracy {fusion_key}, round {round_num} = {clean_acc}")
-        logging.info(f"Global Clean Accuracy {fusion_key}, round {round_num} = {clean_acc}")
-        pois_acc = Utils.evaluate(testloader_poison, eval_model)
-        pois_accuracy[fusion_key][round_num] = pois_acc
-        print(f"Global Backdoor Accuracy {fusion_key}, round {round_num} = {pois_acc}")
-        logging.info(f"Global Backdoor Accuracy {fusion_key}, round {round_num} = {pois_acc}")
+            eval_model = OASISNet().to(device)
+            eval_model.load_state_dict(current_model_state_dict)
+            clean_acc = Utils.evaluate(testloader_clean, eval_model)
+            clean_accuracy[fusion_key][round_num] = clean_acc
+            logging.info(f"Global Clean Accuracy {fusion_key}, round {round_num} = {clean_acc}")
+            pois_acc = Utils.evaluate(testloader_poison, eval_model)
+            pois_accuracy[fusion_key][round_num] = pois_acc
+            logging.info(f"Global Backdoor Accuracy {fusion_key}, round {round_num} = {pois_acc}")
+            party_models_dict[fusion_key] = party_models
 
-for fusion_key in fusion_types:
-    current_model_state_dict = model_dict[fusion_key]
-    current_model = copy.deepcopy(initial_model)
-    current_model.load_state_dict(current_model_state_dict)
-    clean_acc = Utils.evaluate(testloader_clean, current_model)
-    print(f"Clean Accuracy {fusion_key}: {clean_acc}")
-    logging.info(f"Clean Accuracy {fusion_key}: {clean_acc}")
-    pois_acc = Utils.evaluate(testloader_poison, current_model)
-    print(f"Backdoor Accuracy {fusion_key}: {pois_acc}")
-    logging.info(f"Backdoor Accuracy {fusion_key}: {pois_acc}")
-
-
-# -----------------------------
-# Phase 2: asynchronous unlearning (Halimi-style gradient ascent)
-# -----------------------------
-unlearned_model_dict = {}
-for fusion_key in fusion_types_unlearn:
-    if fusion_key == "Retrain":
-        unlearned_model_dict[fusion_key] = copy.deepcopy(initial_model.state_dict())
-
-clean_accuracy_unlearn = {fusion_key: 0 for fusion_key in fusion_types_unlearn}
-pois_accuracy_unlearn = {fusion_key: 0 for fusion_key in fusion_types_unlearn}
-
-for fusion_key in fusion_types:
-    if fusion_key == "Retrain":
-        continue
-
-    initial_model = OASISNet().to(device)
-    fedavg_model_state_dict = copy.deepcopy(model_dict[fusion_key])
-    fedavg_model = copy.deepcopy(initial_model)
-    fedavg_model.load_state_dict(fedavg_model_state_dict)
-
-    party_models = copy.deepcopy(party_models_dict[fusion_key])
-    party0_model = copy.deepcopy(party_models[party_to_be_erased])
-
-    w_fed = nn.utils.parameters_to_vector(fedavg_model.parameters())
-    w_party0 = nn.utils.parameters_to_vector(party0_model.parameters())
-
-    # Compute reference model: w_ref = N/(N-1) * w^T - 1/(N-1) * w^{T-1}_i
-    model_ref_vec = (num_parties / (num_parties - 1)) * w_fed - (1.0 / (num_parties - 1)) * w_party0
-
-    # Compute threshold
-    model_ref = copy.deepcopy(fedavg_model)
-    nn.utils.vector_to_parameters(model_ref_vec, model_ref.parameters())
-
-    eval_model = copy.deepcopy(model_ref)
-    unlearn_clean_acc = Utils.evaluate(testloader_clean, eval_model)
-    print(f"Clean Accuracy for Reference Model = {unlearn_clean_acc}")
-    logging.info(f"Clean Accuracy for Reference Model = {unlearn_clean_acc}")
-    unlearn_pois_acc = Utils.evaluate(testloader_poison, eval_model)
-    print(f"Backdoor Accuracy for Reference Model = {unlearn_pois_acc}")
-    logging.info(f"Backdoor Accuracy for Reference Model = {unlearn_pois_acc}")
-
-    dist_ref_random_lst = []
-    for _ in range(10):
-        dist_ref_random_lst.append(Utils.get_distance(model_ref, OASISNet().to(device)))
-
-    print(f"Mean distance of Reference Model to random: {np.mean(dist_ref_random_lst)}")
-    logging.info(f"Mean distance of Reference Model to random: {np.mean(dist_ref_random_lst)}")
-    threshold = np.mean(dist_ref_random_lst) / 3
-    print(f"Radius for model_ref: {threshold}")
-    logging.info(f"Radius for model_ref: {threshold}")
-    dist_ref_party0_init = Utils.get_distance(model_ref, party0_model)
-    print(f"Distance of Reference Model to party0_model: {dist_ref_party0_init}")
-    logging.info(
-        f"Distance of Reference Model to party0_model: {dist_ref_party0_init}"
-    )
-
-    # Adaptive early-stop threshold based on initial distance to the erased party.
-    distance_threshold = dist_ref_party0_init * unlearn_distance_factor
-    logging.info(
-        f"Initial distance model_ref <-> party0 = {dist_ref_party0_init}"
-    )
-    logging.info(f"Unlearning distance_threshold = {distance_threshold}")
-
-    # --------------------- Unlearning ---------------------
-    model = copy.deepcopy(model_ref)
-
-    criterion = nn.CrossEntropyLoss()
-    opt = torch.optim.SGD(model.parameters(), lr=unlearning_lr, momentum=0.9)
-
-    model.train()
-    for m in model.modules():
-        if isinstance(m, nn.BatchNorm2d):
-            m.eval()
-            m.weight.requires_grad_(True)
-            m.bias.requires_grad_(True)
-
-    flag = False
-    for epoch in range(num_local_epochs_unlearn):
-        print("------------", epoch)
-        logging.info(f"------------ Unlearning Epoch {epoch} ------------")
-        if flag:
-            break
-        for batch_id, (x_batch, y_batch) in enumerate(trainloader_lst[party_to_be_erased]):
-            x_batch = x_batch.to(device)
-            y_batch = y_batch.to(device)
-            opt.zero_grad()
-
-            outputs = model(x_batch)
-            loss = criterion(outputs, y_batch)
-            loss_joint = -loss  # negate the loss for gradient ascent
-            loss_joint.backward()
-            if clip_grad > 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad)
-
-            opt.step()
-
-            with torch.no_grad():
-                distance = Utils.get_distance(model, model_ref)
-                if distance > threshold:
-                    dist_vec = nn.utils.parameters_to_vector(model.parameters()) - nn.utils.parameters_to_vector(
-                        model_ref.parameters()
-                    )
-                    dist_vec = dist_vec / torch.norm(dist_vec) * math.sqrt(threshold)
-                    proj_vec = nn.utils.parameters_to_vector(model_ref.parameters()) + dist_vec
-                    nn.utils.vector_to_parameters(proj_vec, model.parameters())
-                    distance = Utils.get_distance(model, model_ref)
-
-            distance_ref_party_0 = Utils.get_distance(model, party0_model)
-            print("Distance from the unlearned model to party 0:", distance_ref_party_0)
-            logging.info(f"Distance from the unlearned model to party 0: {distance_ref_party_0}")
-
-            if distance_ref_party_0 > distance_threshold:
-                flag = True
-                break
-
-            if num_updates_in_epoch_unlearn is not None and batch_id >= num_updates_in_epoch_unlearn:
-                break
-    # ------------------------------------------------------
-
-    if use_forget_loss and trigger_loader is not None:
-        logging.info("Applying trigger forgetting updates to unlearned model...")
-        run_trigger_forgetting(
-            model=model,
-            trigger_loader=trigger_loader,
-            target_label=target_label,
-            gamma_forget=gamma_forget,
-            trigger_lr=trigger_optimizer_lr,
-            num_epochs=trigger_num_epochs,
-        )
-
-    unlearned_model = copy.deepcopy(model)
-    unlearned_model_dict[fusion_types_unlearn[1]] = unlearned_model.state_dict()
-
-    eval_model = OASISNet().to(device)
-    eval_model.load_state_dict(unlearned_model_dict[fusion_types_unlearn[1]])
-    unlearn_clean_acc = Utils.evaluate(testloader_clean, eval_model)
-    print(f"Clean Accuracy for UN-Local Model = {unlearn_clean_acc}")
-    logging.info(f"Clean Accuracy for UN-Local Model = {unlearn_clean_acc}")
-    clean_accuracy_unlearn[fusion_types_unlearn[1]] = unlearn_clean_acc
-    pois_unlearn_acc = Utils.evaluate(testloader_poison, eval_model)
-    print(f"Backdoor Accuracy for UN-Local Model = {pois_unlearn_acc}")
-    logging.info(f"Backdoor Accuracy for UN-Local Model = {pois_unlearn_acc}")
-    pois_accuracy_unlearn[fusion_types_unlearn[1]] = pois_unlearn_acc
-
-
-# -----------------------------
-# Phase 3: continue FL after unlearning (Retrain vs Unlearn)
-# -----------------------------
-clean_accuracy_unlearn_fl_after_unlearn = {
-    fusion_key: np.zeros(num_fl_after_unlearn_rounds) for fusion_key in fusion_types_unlearn
-}
-pois_accuracy_unlearn_fl_after_unlearn = {
-    fusion_key: np.zeros(num_fl_after_unlearn_rounds) for fusion_key in fusion_types_unlearn
-}
-loss_unlearn = {fusion_key: np.zeros(num_fl_after_unlearn_rounds) for fusion_key in fusion_types_unlearn}
-
-for round_num in range(num_fl_after_unlearn_rounds):
-    local_training = LocalTraining(
-        num_updates_in_epoch=num_updates_in_epoch_after, num_local_epochs=num_local_epochs_after
-    )
-
-    for fusion_key in fusion_types_unlearn:
-        fusion_num_parties = num_parties if fusion_key == "Retrain" else num_parties - 1
-        fusion = FL_round_fusion_selection(num_parties=fusion_num_parties, fusion_key=fusion_key)
-
-        current_model_state_dict = copy.deepcopy(unlearned_model_dict[fusion_key])
-        current_model = OASISNet().to(device)
+    for fusion_key in fusion_types:
+        current_model_state_dict = model_dict[fusion_key]
+        current_model = copy.deepcopy(initial_model)
         current_model.load_state_dict(current_model_state_dict)
+        clean_acc = Utils.evaluate(testloader_clean, current_model)
+        logging.info(f"Clean Accuracy {fusion_key}: {clean_acc}")
+        pois_acc = Utils.evaluate(testloader_poison, current_model)
+        logging.info(f"Backdoor Accuracy {fusion_key}: {pois_acc}")
 
-        # --------------------- Local Training Round ---------------------
-        party_models = []
-        party_losses = []
-        for party_id in range(1, num_parties):
-            model = copy.deepcopy(current_model)
-            model_update, party_loss = local_training.train(
-                model=model,
-                trainloader=trainloader_lst[party_id],
-                criterion=None,
-                opt=None,
-                lr=after_unlearn_lr,
-            )
+    fedavg_before = OASISNet().to(device)
+    fedavg_before.load_state_dict(model_dict["FedAvg"])
 
-            party_models.append(copy.deepcopy(model_update))
-            party_losses.append(party_loss)
+    retrain_before = OASISNet().to(device)
+    retrain_before.load_state_dict(model_dict["Retrain"])
 
-        if len(party_losses) > 0:
-            loss_unlearn[fusion_key][round_num] = np.mean(party_losses)
-        # ----------------------------------------------------------------
+    dist_before_unlearn = Utils.get_distance(fedavg_before, retrain_before)
+    logging.info(
+        "Model distance BEFORE unlearning (FedAvg vs Retrain) = %.6f",
+        dist_before_unlearn,
+    )
 
-        current_model_state_dict = fusion.fusion_algo(
-            party_models=party_models, current_model=current_model
-        )
-        if fusion_key == "Unlearn" and use_forget_loss and trigger_loader is not None:
-            logging.info(
-                "Running server-side forgetting step on trigger set for round %d", round_num
-            )
-            server_model = OASISNet().to(device)
-            server_model.load_state_dict(current_model_state_dict)
+    retrain_pre_ckpt = checkpoint_dir / "retrain_pre_unlearn.pt"
+    fedavg_pre_ckpt = checkpoint_dir / "fedavg_pre_unlearn.pt"
+    torch.save(model_dict["Retrain"], retrain_pre_ckpt)
+    torch.save(model_dict["FedAvg"], fedavg_pre_ckpt)
+    logging.info("Saved pre-unlearning Retrain model to %s", retrain_pre_ckpt)
+    logging.info("Saved pre-unlearning FedAvg model to %s", fedavg_pre_ckpt)
+
+    unlearned_model_dict = {}
+    for fusion_key in fusion_types_unlearn:
+        if fusion_key == "Retrain":
+            unlearned_model_dict[fusion_key] = copy.deepcopy(initial_model.state_dict())
+
+    clean_accuracy_unlearn = {fusion_key: 0 for fusion_key in fusion_types_unlearn}
+    pois_accuracy_unlearn = {fusion_key: 0 for fusion_key in fusion_types_unlearn}
+
+    for fusion_key in fusion_types:
+        if fusion_key == "Retrain":
+            continue
+
+        initial_model = OASISNet().to(device)
+        fedavg_model_state_dict = copy.deepcopy(model_dict[fusion_key])
+        fedavg_model = copy.deepcopy(initial_model)
+        fedavg_model.load_state_dict(fedavg_model_state_dict)
+
+        party_models = copy.deepcopy(party_models_dict[fusion_key])
+        party0_model = copy.deepcopy(party_models[0])
+
+        w_fed = nn.utils.parameters_to_vector(fedavg_model.parameters())
+        w_party0 = nn.utils.parameters_to_vector(party0_model.parameters())
+
+        model_ref_vec = (args.num_parties / (args.num_parties - 1)) * w_fed - (
+            1.0 / (args.num_parties - 1)
+        ) * w_party0
+
+        model_ref = copy.deepcopy(fedavg_model)
+        nn.utils.vector_to_parameters(model_ref_vec, model_ref.parameters())
+
+        eval_model = copy.deepcopy(model_ref)
+        unlearn_clean_acc = Utils.evaluate(testloader_clean, eval_model)
+        logging.info(f"Clean Accuracy for Reference Model = {unlearn_clean_acc}")
+        unlearn_pois_acc = Utils.evaluate(testloader_poison, eval_model)
+        logging.info(f"Backdoor Accuracy for Reference Model = {unlearn_pois_acc}")
+
+        dist_ref_random_lst = []
+        for _ in range(10):
+            dist_ref_random_lst.append(Utils.get_distance(model_ref, OASISNet().to(device)))
+
+        threshold = np.mean(dist_ref_random_lst) / 3
+        dist_ref_party0_init = Utils.get_distance(model_ref, party0_model)
+
+        distance_threshold = dist_ref_party0_init * args.unlearn_distance_factor
+        logging.info(f"Unlearning distance_threshold = {distance_threshold}")
+
+        model = copy.deepcopy(model_ref)
+
+        criterion = nn.CrossEntropyLoss()
+        opt = torch.optim.SGD(model.parameters(), lr=args.unlearning_lr, momentum=0.9)
+
+        model.train()
+        for m in model.modules():
+            if isinstance(m, nn.BatchNorm2d):
+                m.eval()
+                m.weight.requires_grad_(True)
+                m.bias.requires_grad_(True)
+
+        flag = False
+        for _ in range(args.num_local_epochs_unlearn):
+            if flag:
+                break
+
+            for batch_id, (batch_x, batch_y) in enumerate(trainloader_lst[0]):
+                model.train()
+                for m in model.modules():
+                    if isinstance(m, nn.BatchNorm2d):
+                        m.eval()
+                        m.weight.requires_grad_(True)
+                        m.bias.requires_grad_(True)
+
+                model.zero_grad()
+                opt.zero_grad()
+
+                batch_x, batch_y = batch_x.to(device), batch_y.to(device)
+                y_target = args.target_label * torch.ones(batch_y.shape, dtype=batch_y.dtype, device=device)
+
+                y_hat = model(batch_x)
+                loss = -criterion(y_hat, batch_y)
+
+                opt.zero_grad()
+                loss.backward()
+                if args.clip_grad is not None:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.clip_grad)
+                opt.step()
+
+                y_hat_poison = model(batch_x)
+                pois_loss = criterion(y_hat_poison, y_target)
+
+                opt.zero_grad()
+                pois_loss.backward()
+                if args.clip_grad is not None:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.clip_grad)
+                opt.step()
+
+                with torch.no_grad():
+                    model.eval()
+                    for m in model.modules():
+                        if isinstance(m, nn.BatchNorm2d):
+                            m.train()
+                    y_hat_clean = model(batch_x)
+                    _, pred_clean = torch.max(y_hat_clean.data, 1)
+                    accuracy_clean = ((pred_clean == batch_y).sum() / batch_y.shape[0]).item()
+
+                if args.num_updates_in_epoch_unlearn is not None and batch_id >= args.num_updates_in_epoch_unlearn:
+                    break
+
+                with torch.no_grad():
+                    distance = Utils.get_distance(model, model_ref)
+                    if distance > threshold:
+                        dist_vec = nn.utils.parameters_to_vector(model.parameters()) - nn.utils.parameters_to_vector(
+                            model_ref.parameters()
+                        )
+                        dist_vec = dist_vec / torch.norm(dist_vec) * math.sqrt(threshold)
+                        proj_vec = nn.utils.parameters_to_vector(model_ref.parameters()) + dist_vec
+                        nn.utils.vector_to_parameters(proj_vec, model.parameters())
+                        distance = Utils.get_distance(model, model_ref)
+
+                distance_ref_party_0 = Utils.get_distance(model, party0_model)
+                logging.info(f"Distance from the unlearned model to party 0: {distance_ref_party_0}")
+
+                if distance_ref_party_0 > distance_threshold:
+                    flag = True
+                    break
+
+        if args.use_forget_loss and trigger_loader is not None:
+            logging.info("Applying trigger forgetting updates to unlearned model...")
             run_trigger_forgetting(
-                model=server_model,
+                model=model,
                 trigger_loader=trigger_loader,
-                target_label=target_label,
-                gamma_forget=gamma_forget,
-                trigger_lr=trigger_optimizer_lr,
-                num_epochs=trigger_num_epochs,
+                target_label=args.target_label,
+                gamma_forget=args.gamma_forget,
+                trigger_lr=args.trigger_optimizer_lr,
+                num_epochs=args.trigger_num_epochs,
             )
-            current_model_state_dict = copy.deepcopy(server_model.state_dict())
-        unlearned_model_dict[fusion_key] = copy.deepcopy(current_model_state_dict)
-        party_models_dict[fusion_key] = party_models
+
+        unlearned_model = copy.deepcopy(model)
+        unlearned_model_dict[fusion_types_unlearn[1]] = unlearned_model.state_dict()
 
         eval_model = OASISNet().to(device)
-        eval_model.load_state_dict(current_model_state_dict)
+        eval_model.load_state_dict(unlearned_model_dict[fusion_types_unlearn[1]])
         unlearn_clean_acc = Utils.evaluate(testloader_clean, eval_model)
-        print(f"Global Clean Accuracy {fusion_key}, round {round_num} = {unlearn_clean_acc}")
-        logging.info(f"Global Clean Accuracy {fusion_key}, round {round_num} = {unlearn_clean_acc}")
-        clean_accuracy_unlearn_fl_after_unlearn[fusion_key][round_num] = unlearn_clean_acc
-        unlearn_pois_acc = Utils.evaluate(testloader_poison, eval_model)
-        print(f"Global Backdoor Accuracy {fusion_key}, round {round_num} = {unlearn_pois_acc}")
-        logging.info(f"Global Backdoor Accuracy {fusion_key}, round {round_num} = {unlearn_pois_acc}")
-        pois_accuracy_unlearn_fl_after_unlearn[fusion_key][round_num] = unlearn_pois_acc
+        logging.info(f"Clean Accuracy for UN-Local Model = {unlearn_clean_acc}")
+        clean_accuracy_unlearn[fusion_types_unlearn[1]] = unlearn_clean_acc
+        pois_unlearn_acc = Utils.evaluate(testloader_poison, eval_model)
+        logging.info(f"Backdoor Accuracy for UN-Local Model = {pois_unlearn_acc}")
+        pois_accuracy_unlearn[fusion_types_unlearn[1]] = pois_unlearn_acc
+
+    dist_after_unlearn_phase2 = np.nan
+    unlearn_after_phase2_path = checkpoint_dir / "unlearn_after_phase2.pt"
+    if "Unlearn" in unlearned_model_dict:
+        unlearn_after_phase2_model = OASISNet().to(device)
+        unlearn_after_phase2_model.load_state_dict(unlearned_model_dict["Unlearn"])
+        retrain_pre_model = OASISNet().to(device)
+        retrain_pre_model.load_state_dict(model_dict["Retrain"])
+        dist_after_unlearn_phase2 = Utils.get_distance(unlearn_after_phase2_model, retrain_pre_model)
+        torch.save(unlearned_model_dict["Unlearn"], unlearn_after_phase2_path)
+        logging.info("Saved unlearn model after phase2 to %s", unlearn_after_phase2_path)
+
+    clean_accuracy_unlearn_fl_after_unlearn = {
+        fusion_key: np.zeros(args.num_fl_after_unlearn_rounds) for fusion_key in fusion_types_unlearn
+    }
+    pois_accuracy_unlearn_fl_after_unlearn = {
+        fusion_key: np.zeros(args.num_fl_after_unlearn_rounds) for fusion_key in fusion_types_unlearn
+    }
+    loss_unlearn = {fusion_key: np.zeros(args.num_fl_after_unlearn_rounds) for fusion_key in fusion_types_unlearn}
+
+    for round_num in range(args.num_fl_after_unlearn_rounds):
+        local_training = LocalTraining(
+            num_updates_in_epoch=args.num_updates_in_epoch_after, num_local_epochs=args.num_local_epochs_after
+        )
+
+        for fusion_key in fusion_types_unlearn:
+            fusion_num_parties = args.num_parties if fusion_key == "Retrain" else args.num_parties - 1
+            fusion = FL_round_fusion_selection(num_parties=fusion_num_parties, fusion_key=fusion_key)
+
+            current_model_state_dict = copy.deepcopy(unlearned_model_dict[fusion_key])
+            current_model = OASISNet().to(device)
+            current_model.load_state_dict(current_model_state_dict)
+
+            party_models = []
+            party_losses = []
+            for party_id in range(1, args.num_parties):
+                model = copy.deepcopy(current_model)
+                model_update, party_loss = local_training.train(
+                    model=model,
+                    trainloader=trainloader_lst[party_id],
+                    criterion=None,
+                    opt=None,
+                    lr=args.after_unlearn_lr,
+                )
+
+                party_models.append(copy.deepcopy(model_update))
+                party_losses.append(party_loss)
+
+            if len(party_losses) > 0:
+                loss_unlearn[fusion_key][round_num] = np.mean(party_losses)
+
+            current_model_state_dict = fusion.fusion_algo(
+                party_models=party_models, current_model=current_model
+            )
+            if fusion_key == "Unlearn" and args.use_forget_loss and trigger_loader is not None:
+                logging.info(
+                    "Running server-side forgetting step on trigger set for round %d", round_num
+                )
+                server_model = OASISNet().to(device)
+                server_model.load_state_dict(current_model_state_dict)
+                run_trigger_forgetting(
+                    model=server_model,
+                    trigger_loader=trigger_loader,
+                    target_label=args.target_label,
+                    gamma_forget=args.gamma_forget,
+                    trigger_lr=args.trigger_optimizer_lr,
+                    num_epochs=args.trigger_num_epochs,
+                )
+                current_model_state_dict = copy.deepcopy(server_model.state_dict())
+            unlearned_model_dict[fusion_key] = copy.deepcopy(current_model_state_dict)
+            party_models_dict[fusion_key] = party_models
+
+            eval_model = OASISNet().to(device)
+            eval_model.load_state_dict(current_model_state_dict)
+            unlearn_clean_acc = Utils.evaluate(testloader_clean, eval_model)
+            logging.info(f"Global Clean Accuracy {fusion_key}, round {round_num} = {unlearn_clean_acc}")
+            clean_accuracy_unlearn_fl_after_unlearn[fusion_key][round_num] = unlearn_clean_acc
+            unlearn_pois_acc = Utils.evaluate(testloader_poison, eval_model)
+            logging.info(f"Global Backdoor Accuracy {fusion_key}, round {round_num} = {unlearn_pois_acc}")
+            pois_accuracy_unlearn_fl_after_unlearn[fusion_key][round_num] = unlearn_pois_acc
+
+    retrain_ckpt_path = checkpoint_dir / "retrain_final.pt"
+    unlearn_ckpt_path = checkpoint_dir / "unlearn_final.pt"
+    torch.save(unlearned_model_dict["Retrain"], retrain_ckpt_path)
+    torch.save(unlearned_model_dict["Unlearn"], unlearn_ckpt_path)
+    logging.info(f"Saved final Retrain model to {retrain_ckpt_path}")
+    logging.info(f"Saved final Unlearn model to {unlearn_ckpt_path}")
+
+    final_retrain_model = OASISNet().to(device)
+    final_retrain_model.load_state_dict(unlearned_model_dict["Retrain"])
+
+    final_unlearn_model = OASISNet().to(device)
+    final_unlearn_model.load_state_dict(unlearned_model_dict["Unlearn"])
+
+    dist_after_unlearn_final = Utils.get_distance(final_unlearn_model, final_retrain_model)
+    logging.info(
+        "Model distance AFTER unlearning (Unlearn vs Retrain) = %.6f",
+        dist_after_unlearn_final,
+    )
+
+    fl_rounds = [i for i in range(1, args.num_fl_after_unlearn_rounds + 1)]
+
+    plt.plot(
+        fl_rounds,
+        clean_accuracy_unlearn_fl_after_unlearn["Unlearn"],
+        "ro--",
+        linewidth=2,
+        markersize=12,
+        label="UN-Clean Acc",
+    )
+    plt.plot(
+        fl_rounds,
+        pois_accuracy_unlearn_fl_after_unlearn["Unlearn"],
+        "gx--",
+        linewidth=2,
+        markersize=12,
+        label="UN-Backdoor Acc",
+    )
+    plt.plot(
+        fl_rounds,
+        clean_accuracy_unlearn_fl_after_unlearn["Retrain"],
+        "m^-",
+        linewidth=2,
+        markersize=12,
+        label="Retrain-Clean Acc",
+    )
+    plt.plot(
+        fl_rounds,
+        pois_accuracy_unlearn_fl_after_unlearn["Retrain"],
+        "c+-",
+        linewidth=2,
+        markersize=12,
+        label="Retrain-Backdoor Acc",
+    )
+    plt.xlabel("Training Rounds")
+    plt.ylabel("Accuracy")
+    plt.title("OASIS Federated Unlearning: Retrain vs Unlearn")
+    plt.grid()
+    plt.ylim([0, 100])
+    plt.xlim([1, args.num_fl_after_unlearn_rounds])
+    plt.legend()
+
+    image_file_name = f"unlearning_comparison_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+    image_file_path = fig_dir / image_file_name
+    plt.savefig(image_file_path)
+    logging.info(f"Plot saved to {image_file_path}")
+    plt.close()
+
+    rounds_phase1 = list(range(args.num_fl_rounds))
+    rounds_phase3 = list(range(args.num_fl_after_unlearn_rounds))
+
+    metrics = {
+        "rounds_phase1": rounds_phase1,
+        "rounds_phase3": rounds_phase3,
+        "clean_acc_retrain_phase1": clean_accuracy.get("Retrain"),
+        "bd_acc_retrain_phase1": pois_accuracy.get("Retrain"),
+        "clean_acc_fedavg_phase1": clean_accuracy.get("FedAvg"),
+        "bd_acc_fedavg_phase1": pois_accuracy.get("FedAvg"),
+        "clean_acc_unlearn_phase2": clean_accuracy_unlearn.get("Unlearn"),
+        "bd_acc_unlearn_phase2": pois_accuracy_unlearn.get("Unlearn"),
+        "clean_acc_retrain_phase3": clean_accuracy_unlearn_fl_after_unlearn.get("Retrain"),
+        "bd_acc_retrain_phase3": pois_accuracy_unlearn_fl_after_unlearn.get("Retrain"),
+        "clean_acc_unlearn_phase3": clean_accuracy_unlearn_fl_after_unlearn.get("Unlearn"),
+        "bd_acc_unlearn_phase3": pois_accuracy_unlearn_fl_after_unlearn.get("Unlearn"),
+        "dist_before_unlearn": dist_before_unlearn,
+        "dist_after_unlearn_phase2": dist_after_unlearn_phase2,
+        "dist_after_unlearn_final": dist_after_unlearn_final,
+    }
+    save_metrics(exp_dir, metrics)
 
 
-# -----------------------------
-# Plotting
-# -----------------------------
-fl_rounds = [i for i in range(1, num_fl_after_unlearn_rounds + 1)]
-
-plt.plot(
-    fl_rounds,
-    clean_accuracy_unlearn_fl_after_unlearn["Unlearn"],
-    "ro--",
-    linewidth=2,
-    markersize=12,
-    label="UN-Clean Acc",
-)
-plt.plot(
-    fl_rounds,
-    pois_accuracy_unlearn_fl_after_unlearn["Unlearn"],
-    "gx--",
-    linewidth=2,
-    markersize=12,
-    label="UN-Backdoor Acc",
-)
-plt.plot(
-    fl_rounds,
-    clean_accuracy_unlearn_fl_after_unlearn["Retrain"],
-    "m^-",
-    linewidth=2,
-    markersize=12,
-    label="Retrain-Clean Acc",
-)
-plt.plot(
-    fl_rounds,
-    pois_accuracy_unlearn_fl_after_unlearn["Retrain"],
-    "c+-",
-    linewidth=2,
-    markersize=12,
-    label="Retrain-Backdoor Acc",
-)
-plt.xlabel("Training Rounds")
-plt.ylabel("Accuracy")
-plt.title("OASIS Federated Unlearning: Retrain vs Unlearn")
-plt.grid()
-plt.ylim([0, 100])
-plt.xlim([1, num_fl_after_unlearn_rounds])
-plt.legend()
-
-image_file_name = f"unlearning_comparison_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
-image_file_path = IMAGE_DIR / image_file_name
-plt.savefig(image_file_path)
-logging.info(f"Plot saved to {image_file_path}")
-plt.show()
+if __name__ == "__main__":
+    main()
