@@ -10,6 +10,7 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+import torch.nn.functional as F
 from PIL import Image
 from sklearn.model_selection import train_test_split
 from torch import nn
@@ -20,6 +21,10 @@ from utils.fusion import FusionAvg, FusionRetrain
 from utils.local_train import LocalTraining
 from utils.model import OASISNet
 from utils.utils import Utils
+
+# NOTE: This script (fu_oasis_kl.py) reuses the original fu_oasis.py pipeline
+# but replaces the trigger forgetting mechanism with a KL-based consistency
+# loss between clean and triggered predictions (Version B).
 
 # -----------------------------
 # Seeding and device selection
@@ -34,10 +39,13 @@ if torch.cuda.is_available():
 # -----------------------------
 # Logging configuration
 # -----------------------------
-LOG_DIR = Path(__file__).resolve().parent.parent / "doc" / "logs"
-IMAGE_DIR = Path(__file__).resolve().parent.parent / "doc" / "images"
+BASE_DIR = Path(__file__).resolve().parent.parent
+LOG_DIR = BASE_DIR / "doc" / "logs"
+IMAGE_DIR = BASE_DIR / "doc" / "images"
+CHECKPOINT_DIR = BASE_DIR / "doc" / "checkpoints"  # ⭐ 新增：保存模型的目录
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 IMAGE_DIR.mkdir(parents=True, exist_ok=True)
+CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
 
 log_file_name = f"training_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
 log_file_path = LOG_DIR / log_file_name
@@ -92,6 +100,111 @@ def add_oasis_trigger(img_tensor: torch.Tensor) -> torch.Tensor:
     img[:, y_start:, x_start : x_start + 3] = color  # vertical bar
     img[:, y_start : y_start + 3, x_start:] = color  # horizontal bar
     return img
+
+
+def build_trigger_loader(
+    x_test_tensor: torch.Tensor,
+    y_test_tensor: torch.Tensor,
+    trigger_fn,
+    target_label: int,
+    num_samples: int,
+    batch_size: int,
+):
+    """
+    Construct a small trigger validation set used only for forgetting loss.
+
+    Version B: return (x_clean, x_trig) pairs so that the forgetting loss can
+    enforce consistency between clean and triggered predictions.
+    """
+
+    total = len(x_test_tensor)
+    if total == 0 or num_samples <= 0:
+        return None
+
+    unique_classes = torch.unique(y_test_tensor)
+    per_class = max(1, num_samples // max(1, len(unique_classes)))
+    collected_indices = []
+    for cls in unique_classes:
+        cls_indices = torch.where(y_test_tensor == cls)[0]
+        if len(cls_indices) == 0:
+            continue
+        perm = cls_indices[torch.randperm(len(cls_indices))[: min(per_class, len(cls_indices))]]
+        collected_indices.append(perm)
+
+    if not collected_indices:
+        return None
+
+    indices = torch.cat(collected_indices)
+    if len(indices) > num_samples:
+        indices = indices[torch.randperm(len(indices))[:num_samples]]
+
+    x_clean = x_test_tensor[indices].clone()
+    x_trig = x_clean.clone()
+    for idx in range(len(x_trig)):
+        x_trig[idx] = trigger_fn(x_trig[idx])
+
+    dataset = TensorDataset(x_clean, x_trig)
+    loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=NUM_WORKERS_EVAL,
+        pin_memory=PIN_MEMORY,
+        persistent_workers=NUM_WORKERS_EVAL > 0,
+    )
+    return loader
+
+
+def run_trigger_forgetting(
+    model: nn.Module,
+    trigger_loader,
+    target_label: int,
+    gamma_forget: float,
+    trigger_lr: float,
+    num_epochs: int,
+):
+    """
+    Apply explicit forgetting loss updates on the trigger set.
+
+    Version B:
+      Enforce consistency between clean and triggered predictions via
+      KL(p_clean || p_trig), so that the trigger patch does not change
+      the model's behaviour.
+    """
+
+    if trigger_loader is None or gamma_forget <= 0.0:
+        return
+
+    model.train()
+    for m in model.modules():
+        if isinstance(m, nn.BatchNorm2d):
+            m.train()
+
+    optimizer = torch.optim.SGD(model.parameters(), lr=trigger_lr, momentum=0.9)
+
+    for _ in range(max(1, num_epochs)):
+        for x_clean, x_trig in trigger_loader:
+            x_clean = x_clean.to(device)
+            x_trig = x_trig.to(device)
+
+            optimizer.zero_grad()
+
+            with torch.no_grad():
+                logits_clean = model(x_clean)
+                p_clean = F.softmax(logits_clean, dim=1)
+
+            logits_trig = model(x_trig)
+            log_p_trig = F.log_softmax(logits_trig, dim=1)
+
+            kl = F.kl_div(
+                log_p_trig,
+                p_clean,
+                reduction="batchmean",
+            )
+
+            loss = gamma_forget * kl
+            loss.backward()
+            optimizer.step()
 
 
 def _load_balanced_oasis_images(base_dir: Path, max_per_class: int, image_size: int):
@@ -298,7 +411,10 @@ def make_oasis_federated_loaders(
         persistent_workers=NUM_WORKERS_EVAL > 0,
     )
 
-    return trainloader_lst, testloader_clean, testloader_poison
+    x_test_tensor = torch.tensor(x_test, dtype=torch.float32)
+    y_test_tensor = torch.tensor(y_test, dtype=torch.long)
+
+    return trainloader_lst, testloader_clean, testloader_poison, x_test_tensor, y_test_tensor
 
 
 # -----------------------------
@@ -334,13 +450,27 @@ num_updates_in_epoch_after = 50
 num_local_epochs_after = 1
 after_unlearn_lr = 2.5e-3
 
+# Forgetting-loss configuration
+use_forget_loss = True
+gamma_forget = 1.0  # weight that controls how aggressively the trigger predictions are suppressed
+trigger_num_samples = 800  # size of D_trigger; larger improves signal but increases cost
+trigger_batch_size = 64
+trigger_optimizer_lr = 2e-3
+trigger_num_epochs = 1
+
 
 # -----------------------------
 # Data preparation
 # -----------------------------
 print("Preparing OASIS federated loaders...")
 logging.info("Preparing OASIS federated loaders...")
-trainloader_lst, testloader_clean, testloader_poison = make_oasis_federated_loaders(
+(
+    trainloader_lst,
+    testloader_clean,
+    testloader_poison,
+    x_test_tensor,
+    y_test_tensor,
+) = make_oasis_federated_loaders(
     base_dir=base_data_dir,
     num_parties=num_parties,
     image_size=image_size,
@@ -353,6 +483,24 @@ trainloader_lst, testloader_clean, testloader_poison = make_oasis_federated_load
 )
 print("Data preparation complete.")
 logging.info("Data preparation complete.")
+
+trigger_loader = None
+if use_forget_loss:
+    trigger_loader = build_trigger_loader(
+        x_test_tensor=x_test_tensor,
+        y_test_tensor=y_test_tensor,
+        trigger_fn=add_oasis_trigger,
+        target_label=target_label,
+        num_samples=trigger_num_samples,
+        batch_size=trigger_batch_size,
+    )
+    if trigger_loader is not None:
+        logging.info(
+            "Constructed trigger loader with %d samples for forgetting loss",
+            len(trigger_loader.dataset),
+        )
+    else:
+        logging.warning("Trigger loader construction skipped (no samples available).")
 
 
 # -----------------------------
@@ -432,6 +580,33 @@ for fusion_key in fusion_types:
     pois_acc = Utils.evaluate(testloader_poison, current_model)
     print(f"Backdoor Accuracy {fusion_key}: {pois_acc}")
     logging.info(f"Backdoor Accuracy {fusion_key}: {pois_acc}")
+
+    # -----------------------------------------------------
+# NEW: distance BEFORE unlearning + save pre-unlearn ckpts
+# -----------------------------------------------------
+# FedAvg & Retrain at the end of Phase 1
+fedavg_before = OASISNet().to(device)
+fedavg_before.load_state_dict(model_dict["FedAvg"])
+
+retrain_before = OASISNet().to(device)
+retrain_before.load_state_dict(model_dict["Retrain"])
+
+# L2 distance between backdoored FedAvg and clean Retrain
+dist_before_unlearn = Utils.get_distance(fedavg_before, retrain_before)
+print(f"Model distance BEFORE unlearning (FedAvg vs Retrain) = {dist_before_unlearn}")
+logging.info(
+    "Model distance BEFORE unlearning (FedAvg vs Retrain) = %.6f",
+    dist_before_unlearn,
+)
+
+# Save pre-unlearning checkpoints for later analysis
+retrain_pre_ckpt = CHECKPOINT_DIR / "oasis_retrain_pre_unlearn.pt"
+fedavg_pre_ckpt = CHECKPOINT_DIR / "oasis_fedavg_pre_unlearn.pt"
+torch.save(model_dict["Retrain"], retrain_pre_ckpt)
+torch.save(model_dict["FedAvg"], fedavg_pre_ckpt)
+logging.info("Saved pre-unlearning Retrain model to %s", retrain_pre_ckpt)
+logging.info("Saved pre-unlearning FedAvg model to %s", fedavg_pre_ckpt)
+
 
 
 # -----------------------------
@@ -553,6 +728,17 @@ for fusion_key in fusion_types:
                 break
     # ------------------------------------------------------
 
+    if use_forget_loss and trigger_loader is not None:
+        logging.info("Applying trigger forgetting updates to unlearned model...")
+        run_trigger_forgetting(
+            model=model,
+            trigger_loader=trigger_loader,
+            target_label=target_label,
+            gamma_forget=gamma_forget,
+            trigger_lr=trigger_optimizer_lr,
+            num_epochs=trigger_num_epochs,
+        )
+
     unlearned_model = copy.deepcopy(model)
     unlearned_model_dict[fusion_types_unlearn[1]] = unlearned_model.state_dict()
 
@@ -615,6 +801,21 @@ for round_num in range(num_fl_after_unlearn_rounds):
         current_model_state_dict = fusion.fusion_algo(
             party_models=party_models, current_model=current_model
         )
+        if fusion_key == "Unlearn" and use_forget_loss and trigger_loader is not None:
+            logging.info(
+                "Running server-side forgetting step on trigger set for round %d", round_num
+            )
+            server_model = OASISNet().to(device)
+            server_model.load_state_dict(current_model_state_dict)
+            run_trigger_forgetting(
+                model=server_model,
+                trigger_loader=trigger_loader,
+                target_label=target_label,
+                gamma_forget=gamma_forget,
+                trigger_lr=trigger_optimizer_lr,
+                num_epochs=trigger_num_epochs,
+            )
+            current_model_state_dict = copy.deepcopy(server_model.state_dict())
         unlearned_model_dict[fusion_key] = copy.deepcopy(current_model_state_dict)
         party_models_dict[fusion_key] = party_models
 
@@ -628,6 +829,32 @@ for round_num in range(num_fl_after_unlearn_rounds):
         print(f"Global Backdoor Accuracy {fusion_key}, round {round_num} = {unlearn_pois_acc}")
         logging.info(f"Global Backdoor Accuracy {fusion_key}, round {round_num} = {unlearn_pois_acc}")
         pois_accuracy_unlearn_fl_after_unlearn[fusion_key][round_num] = unlearn_pois_acc
+
+
+# ⭐ 新增：保存最终 Retrain / Unlearn 模型，给 t-SNE 等后处理脚本用
+retrain_ckpt_path = CHECKPOINT_DIR / "oasis_retrain_final.pt"
+unlearn_ckpt_path = CHECKPOINT_DIR / "oasis_unlearn_final.pt"
+torch.save(unlearned_model_dict["Retrain"], retrain_ckpt_path)
+torch.save(unlearned_model_dict["Unlearn"], unlearn_ckpt_path)
+logging.info(f"Saved final Retrain model to {retrain_ckpt_path}")
+logging.info(f"Saved final Unlearn model to {unlearn_ckpt_path}")
+
+# -----------------------------------------------------
+# NEW: distance AFTER unlearning (final Unlearn vs Retrain)
+# -----------------------------------------------------
+final_retrain_model = OASISNet().to(device)
+final_retrain_model.load_state_dict(unlearned_model_dict["Retrain"])
+
+final_unlearn_model = OASISNet().to(device)
+final_unlearn_model.load_state_dict(unlearned_model_dict["Unlearn"])
+
+dist_after_unlearn = Utils.get_distance(final_unlearn_model, final_retrain_model)
+print(f"Model distance AFTER unlearning (Unlearn vs Retrain) = {dist_after_unlearn}")
+logging.info(
+    "Model distance AFTER unlearning (Unlearn vs Retrain) = %.6f",
+    dist_after_unlearn,
+)
+
 
 
 # -----------------------------
